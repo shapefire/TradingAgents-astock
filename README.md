@@ -134,6 +134,7 @@
 | **新浪财经** | HTTP | K 线历史、财报三表 |
 | **同花顺** | HTTP (10jqka) | EPS 一致预期 |
 | **财联社** | HTTP (cls.cn) | 全球财经快讯 |
+| **百度股市通** | HTTP (finance.pae.baidu) | 概念板块分类、资金流向 |
 
 > 完全不依赖 Tushare（积分墙）、Alpha Vantage（海外 API）、Yahoo Finance（不支持 A 股）。
 
