@@ -154,11 +154,28 @@ st.markdown(
 
 # ── Build config ─────────────────────────────────────────────────────────────
 
+_PROVIDER_URLS: dict[str, str | None] = {
+    "mimo": "https://token-plan-cn.xiaomimimo.com/v1",
+    "minimax": "https://api.minimax.chat/v1",
+    "deepseek": "https://api.deepseek.com",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "glm": "https://open.bigmodel.cn/api/paas/v4/",
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com/",
+    "xai": "https://api.x.ai/v1",
+    "ollama": "http://localhost:11434/v1",
+    "google": None,
+}
+
+
 def _build_config() -> dict:
     config = DEFAULT_CONFIG.copy()
-    config["llm_provider"] = st.session_state.get("llm_provider", "minimax")
-    config["deep_think_llm"] = st.session_state.get("deep_think_llm", "MiniMax-M2.7")
-    config["quick_think_llm"] = st.session_state.get("quick_think_llm", "MiniMax-M2.7-highspeed")
+    provider = st.session_state.get("llm_provider", "mimo")
+    config["llm_provider"] = provider
+    config["deep_think_llm"] = st.session_state.get("deep_think_llm", "mimo-v2.5-pro")
+    config["quick_think_llm"] = st.session_state.get("quick_think_llm", "mimo-v2.5-pro")
+    if provider in _PROVIDER_URLS:
+        config["backend_url"] = _PROVIDER_URLS[provider]
     # Optional third-party / proxy endpoint. Sidebar input wins, else .env BACKEND_URL.
     backend_url = (st.session_state.get("llm_base_url") or os.getenv("BACKEND_URL") or "").strip()
     config["backend_url"] = backend_url or None

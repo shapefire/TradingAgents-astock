@@ -11,6 +11,7 @@ from web.history import get_history
 
 # Provider display names in recommended order
 _PROVIDERS: list[tuple[str, str]] = [
+    ("小米 MiMo（推荐·国内直连）", "mimo"),
     ("MiniMax（推荐·国内直连）", "minimax"),
     ("DeepSeek", "deepseek"),
     ("通义千问 Qwen", "qwen"),

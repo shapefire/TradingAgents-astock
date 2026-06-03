@@ -8,7 +8,7 @@ from tradingagents.llm_clients.model_catalog import get_model_options
 
 console = Console()
 
-TICKER_INPUT_EXAMPLES = "Examples: SPY, CNC.TO, 7203.T, 0700.HK"
+TICKER_INPUT_EXAMPLES = "例如: 300750 或 宁德时代"
 
 ANALYST_ORDER = [
     ("Market Analyst", AnalystType.MARKET),
@@ -19,10 +19,10 @@ ANALYST_ORDER = [
 
 
 def get_ticker() -> str:
-    """Prompt the user to enter a ticker symbol."""
+    """Prompt the user to enter an A-stock ticker or name."""
     ticker = questionary.text(
-        f"Enter the exact ticker symbol to analyze ({TICKER_INPUT_EXAMPLES}):",
-        validate=lambda x: len(x.strip()) > 0 or "Please enter a valid ticker symbol.",
+        f"请输入A股代码或中文股票名称（{TICKER_INPUT_EXAMPLES}）:",
+        validate=lambda x: len(x.strip()) > 0 or "请输入有效的股票代码或名称。",
         style=questionary.Style(
             [
                 ("text", "fg:green"),
@@ -32,25 +32,21 @@ def get_ticker() -> str:
     ).ask()
 
     if not ticker:
-        console.print("\n[red]No ticker symbol provided. Exiting...[/red]")
+        console.print("\n[red]未输入股票代码，退出...[/red]")
         exit(1)
 
     return normalize_ticker_symbol(ticker)
 
 
 def normalize_ticker_symbol(ticker: str) -> str:
-    """Normalize ticker input while preserving exchange suffixes.
+    """Normalize A-stock ticker: resolve Chinese names to 6-digit codes."""
+    from tradingagents.dataflows.a_stock import resolve_ticker
 
-    Also validates the result is safe to interpolate into a filesystem path —
-    the ticker becomes a directory name under ``results_dir`` and the report
-    save path, so an input like ``../../tmp/evil`` would otherwise escape the
-    intended directory (#51). ``safe_ticker_component`` rejects ``/``, ``..``,
-    ``~`` etc. and auto-resolves Chinese names to A-stock codes; it raises
-    ``ValueError`` on anything unsafe.
-    """
-    from tradingagents.dataflows.utils import safe_ticker_component
-
-    return safe_ticker_component(ticker.strip().upper())
+    raw = ticker.strip()
+    try:
+        return resolve_ticker(raw)
+    except ValueError:
+        return raw.upper()
 
 
 def get_analysis_date() -> str:
@@ -68,9 +64,9 @@ def get_analysis_date() -> str:
             return False
 
     date = questionary.text(
-        "Enter the analysis date (YYYY-MM-DD):",
+        "请输入分析日期 (YYYY-MM-DD):",
         validate=lambda x: validate_date(x.strip())
-        or "Please enter a valid date in YYYY-MM-DD format.",
+        or "请输入有效的日期格式 YYYY-MM-DD。",
         style=questionary.Style(
             [
                 ("text", "fg:green"),
@@ -80,7 +76,7 @@ def get_analysis_date() -> str:
     ).ask()
 
     if not date:
-        console.print("\n[red]No date provided. Exiting...[/red]")
+        console.print("\n[red]未输入日期，退出...[/red]")
         exit(1)
 
     return date.strip()

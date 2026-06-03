@@ -502,9 +502,9 @@ def get_user_selections():
     # Step 1: Ticker symbol
     console.print(
         create_question_box(
-            "Step 1: Ticker Symbol",
-            "Enter the exact ticker symbol to analyze, including exchange suffix when needed (examples: SPY, CNC.TO, 7203.T, 0700.HK)",
-            "SPY",
+            "Step 1: 股票代码",
+            "请输入A股代码或中文股票名称（例如: 300750 或 宁德时代）",
+            "300750",
         )
     )
     selected_ticker = get_ticker()
@@ -513,8 +513,8 @@ def get_user_selections():
     default_date = datetime.datetime.now().strftime("%Y-%m-%d")
     console.print(
         create_question_box(
-            "Step 2: Analysis Date",
-            "Enter the analysis date (YYYY-MM-DD)",
+            "Step 2: 分析日期",
+            "请输入分析日期 (YYYY-MM-DD)",
             default_date,
         )
     )

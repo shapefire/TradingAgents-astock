@@ -101,6 +101,14 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Custom model ID", "custom"),
         ],
     },
+    "mimo": {
+        "quick": [
+            ("MiMo V2.5 Pro - 小米旗舰模型", "mimo-v2.5-pro"),
+        ],
+        "deep": [
+            ("MiMo V2.5 Pro - 小米旗舰模型", "mimo-v2.5-pro"),
+        ],
+    },
     "minimax": {
         "quick": [
             ("MiniMax-M2.7-highspeed - Latest fast model", "MiniMax-M2.7-highspeed"),
