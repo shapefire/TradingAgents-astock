@@ -12,7 +12,7 @@ DEFAULT_CONFIG = {
     # Pending entries are never pruned. None disables rotation entirely.
     "memory_log_max_entries": None,
     # LLM settings
-    "llm_provider": "openai",
+    "llm_provider": "mimo",
     "deep_think_llm": "mimo-v2.5-pro",
     "quick_think_llm": "mimo-v2.5-pro",
     # When None, each provider's client falls back to its own default endpoint
@@ -25,6 +25,10 @@ DEFAULT_CONFIG = {
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
     "anthropic_effort": None,           # "high", "medium", "low"
+    # LLM call timeout in seconds. Prevents a slow or unresponsive provider
+    # from blocking the entire pipeline indefinitely.  120 s is generous for
+    # normal calls (10-30 s) while still catching genuine hangs.
+    "llm_timeout": 120,
     # Checkpoint/resume: when True, LangGraph saves state after each node
     # so a crashed run can resume from the last successful step.
     "checkpoint_enabled": False,

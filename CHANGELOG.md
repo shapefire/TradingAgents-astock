@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [2026-06-14]
+
+### Added
+
+- **小米 MiMo / MiniMax 供应商**：CLI 供应商选择列表新增「小米 MiMo（推荐·国内直连）」和
+  「MiniMax」两个选项，base_url 分别指向 `token-plan-cn.xiaomimimo.com` 和 `api.minimax.chat`。
+- **数据预取（`prefetch.py`）**：分析流水线启动前，用 `ThreadPoolExecutor`（6 线程）并行预取
+  14 个确定性工具数据（新闻、基本面、资金流、龙虎榜、解禁、行业对比等），结果写入 vendor
+  缓存。分析师工具调用命中缓存时秒返回，整体 HTTP 耗时从 ~80 s 降至 ~5-10 s（取决于最慢单次请求）。
+- **LLM 调用超时**：新增 `llm_timeout` 配置项（默认 120 s），防止慢/无响应的 LLM 供应商
+  无限阻塞整条流水线。所有 provider 的 `with_structured_output` 调用均传入该 timeout。
+
+### Changed
+
+- **`route_to_vendor` 结果缓存**：`interface.py` 新增 per-run vendor 缓存（key = method +
+  args + kwargs），同一分析运行内的重复工具调用直接返回缓存结果，不再重复发 HTTP 请求。
+  每次 `propagate()` 开始时通过 `clear_vendor_cache()` 清空旧数据。
+
+### Fixed
+
+- **mootdx 连接失败不再崩溃**：`_build_name_code_map()` 新增 try/except 包裹 mootdx
+  `Quotes.factory()` 和 `client.stocks()` 调用，连接失败时返回空映射（不再抛异常）；
+  `resolve_ticker()` 检测到空映射时抛出清晰的中文错误提示（指引用户直接输入 6 位代码），
+  而非让 `NoneType` 错误在下游扩散。失败时不缓存结果（`_name_to_code` 保持 `None`），
+  下次调用自动重试——瞬时网络故障可自然恢复，无需重启进程。
+
 ## [0.2.13] — 2026-06-04
 
 ### Security

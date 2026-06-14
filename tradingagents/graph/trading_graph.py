@@ -25,6 +25,8 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.interface import clear_vendor_cache
+from tradingagents.dataflows.prefetch import prefetch_vendor_data
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -142,6 +144,11 @@ class TradingAgentsGraph:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
         provider = self.config.get("llm_provider", "").lower()
+
+        # Global LLM timeout — prevents a slow provider from hanging the pipeline
+        llm_timeout = self.config.get("llm_timeout")
+        if llm_timeout:
+            kwargs["timeout"] = llm_timeout
 
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
@@ -305,6 +312,11 @@ class TradingAgentsGraph:
         with a per-ticker SqliteSaver so a crashed run can resume from the last
         successful node on a subsequent invocation with the same ticker+date.
         """
+        # Clear the per-run data cache so stale results from a prior run are
+        # never served.  Individual tool calls and prefetch_vendor_data() will
+        # populate this cache during the run.
+        clear_vendor_cache()
+
         self.ticker = company_name
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
@@ -338,6 +350,12 @@ class TradingAgentsGraph:
 
     def _run_graph(self, company_name, trade_date):
         """Execute the graph and write the resulting state to disk and memory log."""
+        # Pre-fetch deterministic tool data in parallel so that analyst tool
+        # calls are instant cache hits.  This runs ONCE before the LangGraph
+        # pipeline begins; results are stored in the vendor cache that
+        # route_to_vendor() reads from.
+        prefetch_vendor_data(company_name, str(trade_date))
+
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
         init_agent_state = self.propagator.create_initial_state(

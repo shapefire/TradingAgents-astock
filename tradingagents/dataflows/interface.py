@@ -199,8 +199,37 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
+# ---------------------------------------------------------------------------
+# Per-run vendor cache — populated by prefetch_vendor_data() and individual
+# tool calls, cleared at the start of each analysis run via clear_vendor_cache().
+# Key: (method, args_tuple, frozenset_of_kwargs) → cached return value
+# ---------------------------------------------------------------------------
+_vendor_cache: dict[tuple, object] = {}
+
+
+def clear_vendor_cache() -> None:
+    """Clear the per-run vendor cache.
+
+    Called at the start of each analysis run (TradingAgentsGraph.propagate)
+    so that stale data from a previous run is never served.
+    """
+    global _vendor_cache
+    _vendor_cache = {}
+
+
 def route_to_vendor(method: str, *args, **kwargs):
-    """Route method calls to appropriate vendor implementation with fallback support."""
+    """Route method calls to appropriate vendor implementation with caching and fallback support.
+
+    Results are cached per (method, args, kwargs) tuple so that duplicate calls
+    within the same analysis run (e.g. get_news called by 5 different analysts)
+    return instantly without redundant HTTP requests.  The cache is cleared at
+    the start of each propagate() call.
+    """
+    # Build cache key — all tool args are str/int/bool (hashable)
+    cache_key = (method, args, tuple(sorted(kwargs.items())))
+    if cache_key in _vendor_cache:
+        return _vendor_cache[cache_key]
+
     category = get_category_for_method(method)
     vendor_config = get_vendor(category, method)
     primary_vendors = [v.strip() for v in vendor_config.split(',')]
@@ -223,7 +252,9 @@ def route_to_vendor(method: str, *args, **kwargs):
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
+            _vendor_cache[cache_key] = result
+            return result
         except AlphaVantageRateLimitError:
             continue  # Only rate limits trigger fallback
 

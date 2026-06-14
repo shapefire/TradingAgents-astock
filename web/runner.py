@@ -70,6 +70,8 @@ def _infer_active_stage(tracker: ProgressTracker) -> None:
 def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -> None:
     """Execute the full pipeline in the current thread."""
     from cli.stats_handler import StatsCallbackHandler
+    from tradingagents.dataflows.interface import clear_vendor_cache
+    from tradingagents.dataflows.prefetch import prefetch_vendor_data
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
     stats = StatsCallbackHandler()
@@ -79,6 +81,10 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
         config=config,
         callbacks=[stats],
     )
+
+    # Clear per-run cache and pre-fetch deterministic data in parallel.
+    clear_vendor_cache()
+    prefetch_vendor_data(ticker, str(trade_date))
 
     init_state = graph.propagator.create_initial_state(ticker, trade_date)
     args = graph.propagator.get_graph_args(callbacks=[stats])

@@ -76,34 +76,162 @@ _code_to_name: dict[str, str] | None = None
 
 
 def _build_name_code_map() -> tuple[dict[str, str], dict[str, str]]:
-    """Build name→code and code→name maps via mootdx (both SH & SZ markets)."""
+    """Build name→code and code→name maps via mootdx or HTTP fallback.
+
+    Strategy:
+    1. Try mootdx TCP (fast, full market data)
+    2. If mootdx fails (overseas network), fallback to Eastmoney HTTP API
+
+    Returns empty dicts if both methods fail.
+    On failure the cache is NOT populated (``_name_to_code`` stays ``None``)
+    so the next call automatically retries — transient network issues recover
+    naturally without any manual reset.
+    """
     global _name_to_code, _code_to_name
     if _name_to_code is not None:
         return _name_to_code, _code_to_name
 
-    from mootdx.quotes import Quotes
+    # Method 1: Try mootdx TCP (preferred for speed)
+    n2c, c2n = _build_name_code_map_mootdx()
+    if n2c:
+        _name_to_code = n2c
+        _code_to_name = c2n
+        return _name_to_code, _code_to_name
 
-    client = Quotes.factory(market="std")
+    # Method 2: Fallback to HTTP API (works overseas)
+    logger.info("mootdx unavailable, trying HTTP API fallback for name-code map")
+    n2c, c2n = _build_name_code_map_http()
+    if n2c:
+        _name_to_code = n2c
+        _code_to_name = c2n
+        return _name_to_code, _code_to_name
+
+    return {}, {}
+
+
+def resolve_ticker_online(name: str) -> str:
+    """Resolve Chinese stock name to 6-digit code via Eastmoney search API.
+
+    This is a lightweight alternative to building full market map.
+    Works even when push2 API is blocked by proxy.
+    """
+    import urllib.parse
+    try:
+        encoded_name = urllib.parse.quote(name)
+        url = (
+            f"http://searchapi.eastmoney.com/api/suggest/get?"
+            f"input={encoded_name}&type=14"
+            f"&token=D43BF722C8E33BDC906FB84D85E326E8&count=5"
+        )
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", _UA)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = _json.loads(resp.read().decode("utf-8"))
+
+        items = data.get("QuotationCodeTable", {}).get("Data", [])
+        if not items:
+            return ""
+
+        # Find first A-stock result
+        for item in items:
+            if item.get("Classify") == "AStock":
+                code = item.get("UnifiedCode", "")
+                if code and _re.match(r"^[036]\d{5}$", code):
+                    return code
+
+        return ""
+    except Exception as exc:
+        logger.warning("Eastmoney search API failed for '%s': %s", name, exc)
+        return ""
+
+
+def _build_name_code_map_mootdx() -> tuple[dict[str, str], dict[str, str]]:
+    """Build name→code map via mootdx TCP (both SH & SZ markets).
+
+    Returns empty dicts if mootdx is unreachable (e.g. TCP 7709 down).
+    """
+    try:
+        from mootdx.quotes import Quotes
+
+        client = Quotes.factory(market="std")
+    except Exception as exc:
+        logger.warning("mootdx connection failed: %s", exc)
+        return {}, {}
+
     n2c: dict[str, str] = {}
     c2n: dict[str, str] = {}
 
-    for market in (0, 1):  # 0=SZ, 1=SH
-        stocks = client.stocks(market=market)
-        if stocks is None or stocks.empty:
-            continue
-        for _, row in stocks.iterrows():
-            code = str(row["code"]).strip()
-            name = str(row["name"]).strip()
+    try:
+        for market in (0, 1):  # 0=SZ, 1=SH
+            stocks = client.stocks(market=market)
+            if stocks is None or stocks.empty:
+                continue
+            for _, row in stocks.iterrows():
+                code = str(row["code"]).strip()
+                name = str(row["name"]).strip()
+                if not _re.match(r"^[036]\d{5}$", code):
+                    continue
+                clean_name = name.replace(" ", "").replace("　", "")
+                n2c[clean_name] = code
+                c2n[code] = clean_name
+    except Exception as exc:
+        logger.warning("mootdx stocks() failed: %s", exc)
+        return {}, {}
+
+    logger.info("Built stock name-code map via mootdx: %d entries", len(n2c))
+    return n2c, c2n
+
+
+def _build_name_code_map_http() -> tuple[dict[str, str], dict[str, str]]:
+    """Build name→code map via Eastmoney HTTP API (works overseas).
+
+    Uses push2 API to fetch full A-stock list (~5000 stocks).
+    Returns empty dicts if HTTP request fails.
+    """
+    n2c: dict[str, str] = {}
+    c2n: dict[str, str] = {}
+
+    try:
+        # Eastmoney push2 API: fs=m:0+t:6 (SZ main), m:0+t:80 (SZ SME),
+        # m:1+t:2 (SH main), m:1+t:23 (SH STAR)
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1",
+            "pz": "10000",
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f3",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f14",
+        }
+        r = _em_get(url, params=params, timeout=30)
+        data = r.json()
+
+        items = data.get("data", {}).get("diff", [])
+        if not items:
+            logger.warning("Eastmoney HTTP API returned empty stock list")
+            return {}, {}
+
+        for item in items:
+            code = str(item.get("f12", "")).strip()
+            name = str(item.get("f14", "")).strip()
+            if not code or not name:
+                continue
             if not _re.match(r"^[036]\d{5}$", code):
                 continue
             clean_name = name.replace(" ", "").replace("　", "")
             n2c[clean_name] = code
             c2n[code] = clean_name
 
-    _name_to_code = n2c
-    _code_to_name = c2n
-    logger.info("Built stock name-code map: %d entries", len(n2c))
-    return _name_to_code, _code_to_name
+        logger.info("Built stock name-code map via HTTP: %d entries", len(n2c))
+        return n2c, c2n
+
+    except Exception as exc:
+        logger.warning("Eastmoney HTTP API failed for name-code map: %s", exc)
+        return {}, {}
 
 
 def resolve_ticker(user_input: str) -> str:
@@ -125,15 +253,30 @@ def resolve_ticker(user_input: str) -> str:
     clean = s.replace(" ", "").replace("　", "")
     n2c, _ = _build_name_code_map()
 
-    if clean in n2c:
-        return n2c[clean]
+    # Try local map first
+    if n2c:
+        if clean in n2c:
+            return n2c[clean]
 
-    matches = {name: code for name, code in n2c.items() if clean in name}
-    if len(matches) == 1:
-        return next(iter(matches.values()))
-    if len(matches) > 1:
-        examples = ", ".join(f"{n}({c})" for n, c in list(matches.items())[:5])
-        raise ValueError(f"'{s}' 匹配到多只股票: {examples}，请输入完整名称或代码")
+        matches = {name: code for name, code in n2c.items() if clean in name}
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        if len(matches) > 1:
+            examples = ", ".join(f"{n}({c})" for n, c in list(matches.items())[:5])
+            raise ValueError(f"'{s}' 匹配到多只股票: {examples}，请输入完整名称或代码")
+
+    # Fallback: online search API (works even when push2 is blocked)
+    logger.info("Local map miss for '%s', trying online search API", s)
+    code = resolve_ticker_online(clean)
+    if code:
+        logger.info("Resolved '%s' -> %s via online search API", s, code)
+        return code
+
+    if not n2c:
+        raise ValueError(
+            f"无法解析中文股票名 '{s}'：本地映射表为空且在线搜索失败。"
+            "请直接输入 6 位股票代码（如 000539）"
+        )
 
     raise ValueError(f"找不到股票 '{s}'，请检查名称是否正确")
 
