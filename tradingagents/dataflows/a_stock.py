@@ -6,10 +6,15 @@ or mootdx TCP.
 Data sources:
 - mootdx (TCP 7709): OHLCV K-lines, financial snapshots, F10 text
 - Tencent Finance (HTTP GBK): PE/PB/market cap/turnover
-- 东方财富 push2 / datacenter-web (direct HTTP): stock info, dragon-tiger, lockup
+- 东方财富 push2 / datacenter-web (direct HTTP): stock info, dragon-tiger, lockup,
+  fund flow, concept blocks (V3.2.2 replaces Baidu PAE), industry comparison
 - 新浪财经 (direct HTTP): K-line fallback, financial statements
 - 同花顺 (direct HTTP): consensus EPS, hot stocks, northbound capital flow
-- 财联社 (direct HTTP): global news wire
+
+V3.2.2 changes (aligned with a-stock-data SKILL.md):
+- Concept blocks: Baidu PAE getrelatedblock → 东财 slist API (spt=3)
+- Global news: CLS wire offline (cls.cn migrated to Next.js) → Eastmoney 7x24 only
+- Sina financial reports: Fixed report_list parsing structure
 """
 
 from __future__ import annotations
@@ -912,6 +917,10 @@ def _get_financial_report_sina(
     """Shared helper: fetch financial report via Sina direct HTTP API.
 
     report_type: '资产负债表' | '利润表' | '现金流量表'
+
+    V3.2.2: Fixed parsing for report_list structure. Sina actually returns
+    result.data.report_list as a dict keyed by period (e.g. '20260331'),
+    where each period's data field is a list of items with item_title/item_value.
     """
     _report_type_map = {
         "资产负债表": "fzb",
@@ -933,12 +942,32 @@ def _get_financial_report_sina(
     r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
     d = r.json()
 
-    result = d.get("result", {}).get("data", {})
-    items = result.get(source_type, [])
-    if not isinstance(items, list) or not items:
+    # V3.2.2: Sina structure is result.data.report_list (dict keyed by period)
+    report_list = (
+        d.get("result", {}).get("data", {}).get("report_list", {}) or {}
+    )
+    if not report_list:
         return pd.DataFrame()
 
-    df = pd.DataFrame(items)
+    # Parse each period's items into rows
+    rows = []
+    for period in sorted(report_list.keys(), reverse=True)[:20]:
+        obj = report_list[period]
+        rec = {"报告日": f"{period[:4]}-{period[4:6]}-{period[6:8]}"}
+        for it in obj.get("data", []) or []:
+            title = it.get("item_title", "")
+            if not title or it.get("item_value") is None:
+                continue
+            rec[title] = it.get("item_value")
+            tongbi = it.get("item_tongbi")
+            if tongbi not in (None, ""):
+                rec[f"{title}_同比"] = tongbi
+        rows.append(rec)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
 
     # Filter by curr_date
     if curr_date and "报告日" in df.columns:
@@ -1211,7 +1240,11 @@ def get_global_news(
     look_back_days: Annotated[int, "Days to look back"] = 7,
     limit: Annotated[int, "Max articles"] = 10,
 ) -> str:
-    """Get China/global financial news via direct HTTP (CLS + Eastmoney)."""
+    """Get China/global financial news via Eastmoney global news (direct HTTP).
+
+    V3.2.2: CLS wire (财联社) API is offline since 2026-05 (cls.cn migrated
+    to Next.js, old API returns 404). Now only uses Eastmoney 7x24 news.
+    """
     start_dt = datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(
         days=look_back_days
     )
@@ -1219,35 +1252,10 @@ def get_global_news(
 
     all_news: list[dict] = []
 
-    # Source 1: CLS wire (财联社快讯) — direct HTTP
+    # Source: Eastmoney global (东财7x24资讯) — direct HTTP (cls.cn offline)
     try:
-        cls_url = "https://www.cls.cn/nodeapi/telegraphList"
-        cls_params = {"rn": str(limit), "page": "1"}
-        cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
-        r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
-        d_cls = r_cls.json()
-        for item in d_cls.get("data", {}).get("roll_data", []):
-            title = item.get("title", "") or item.get("brief", "")
-            content = item.get("content", "") or item.get("brief", "")
-            ctime = item.get("ctime", "")
-            # ctime is unix timestamp
-            pub_time = ""
-            if ctime:
-                try:
-                    pub_time = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M")
-                except (ValueError, TypeError, OSError):
-                    pub_time = str(ctime)
-            all_news.append({
-                "title": title,
-                "content": content,
-                "time": pub_time,
-                "source": "CLS Wire",
-            })
-    except Exception as e:
-        logger.warning("CLS news fetch failed: %s", e)
+        import uuid as _uuid
 
-    # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
-    try:
         em_url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
         em_params = {
             "client": "web",
@@ -1255,7 +1263,7 @@ def get_global_news(
             "fastColumn": "102",
             "sortEnd": "",
             "pageSize": str(limit),
-            "req_trace": str(uuid.uuid4()),
+            "req_trace": str(_uuid.uuid4()),
         }
         em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
         r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
@@ -1686,19 +1694,9 @@ def get_northbound_flow(
 
 
 # ---------------------------------------------------------------------------
-# Baidu PAE (百度股市通) helpers
+# Concept/Sector Blocks — 东财 slist (replaces deprecated Baidu PAE)
+# V3.2.2: Baidu PAE getrelatedblock returns ResultCode 10003, use 东财 slist
 # ---------------------------------------------------------------------------
-
-_BAIDU_PAE_HEADERS = {
-    "Host": "finance.pae.baidu.com",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) "
-        "Gecko/20100101 Firefox/110.0"
-    ),
-    "Accept": "application/vnd.finance-web.v1+json",
-    "Origin": "https://gushitong.baidu.com",
-    "Referer": "https://gushitong.baidu.com/",
-}
 
 
 # ---- 13. get_concept_blocks ----
@@ -1707,58 +1705,62 @@ _BAIDU_PAE_HEADERS = {
 def get_concept_blocks(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
 ) -> str:
-    """Get concept/sector/region blocks that a stock belongs to (百度股市通).
+    """Get concept/sector/region blocks that a stock belongs to (东财 slist).
 
-    Returns industry classification (申万), concept themes, and region.
+    V3.2.2: Replaced Baidu PAE getrelatedblock (ResultCode 10003 + empty array)
+    with 东财 slist API (spt=3). One request gets ALL blocks (industry + concept
+    + region mixed), with BK codes, change_pct, and lead stocks.
+
+    Returns industry classification, concept themes, and region.
     Each block includes current day's change percentage.
     """
-    import requests
-
     code = _normalize_ticker(ticker)
 
     try:
-        url = (
-            "https://finance.pae.baidu.com/api/getrelatedblock"
-            f'?stock=[{{"code":"{code}","market":"ab","type":"stock"}}]'
-            "&finClientType=pc"
-        )
-        r = requests.get(url, headers=_BAIDU_PAE_HEADERS, timeout=10)
+        market_code = 1 if code.startswith("6") else 0
+        url = "https://push2.eastmoney.com/api/qt/slist/get"
+        params = {
+            "fltt": "2",
+            "invt": "2",
+            "secid": f"{market_code}.{code}",
+            "spt": "3",
+            "pi": "0",
+            "pz": "200",
+            "po": "1",
+            "fields": "f12,f14,f3,f128",
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        r = _em_get(url, params=params, headers=headers, timeout=15)
         d = r.json()
 
-        if str(d.get("ResultCode", -1)) != "0":
-            return (
-                f"Baidu PAE error: ResultCode={d.get('ResultCode')} "
-                f"{d.get('ResultMsg', '')}"
-            )
+        diff = (d.get("data") or {}).get("diff") or {}
+        items = diff.values() if isinstance(diff, dict) else diff
 
-        result = d.get("Result", {})
-        categories = result.get(code, [])
-        if not categories:
+        if not items:
             return f"No concept/block data for {code}"
 
         lines = [
             f"# Concept & Sector Blocks for {code} (A-stock)",
-            f"# Source: 百度股市通 (Baidu PAE)",
+            f"# Source: 东财 slist (V3.2.2, replaces Baidu PAE)",
             f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             "",
+            "Board Name | BK Code | Change % | Lead Stock",
+            "--- | --- | --- | ---",
         ]
 
         concept_names: list[str] = []
 
-        for cat in categories:
-            cat_name = cat.get("name", "")
-            items = cat.get("list", [])
-            if not items:
-                continue
-            lines.append(f"## {cat_name}")
-            for item in items:
-                name = item.get("name", "")
-                ratio = item.get("ratio", "")
-                desc = item.get("describe", "")
-                suffix = f" ({desc})" if desc else ""
-                lines.append(f"  {name}{suffix}: {ratio}")
-                if cat_name == "概念":
-                    concept_names.append(name)
+        for it in items:
+            name = it.get("f14", "")
+            bk_code = it.get("f12", "")
+            change_pct = it.get("f3", "")
+            lead_stock = it.get("f128", "")
+            lines.append(f"{name} | {bk_code} | {change_pct}% | {lead_stock}")
+            if name:
+                concept_names.append(name)
 
         if concept_names:
             lines.append(f"\nConcept tags: {' / '.join(concept_names)}")
