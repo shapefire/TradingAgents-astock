@@ -6,9 +6,9 @@ pre-fetched.  Tools like ``get_news`` (LLM picks date range) or
 ``get_indicators`` (LLM picks indicator name) are left for the first analyst
 that needs them; subsequent analysts benefit from the vendor cache automatically.
 
-The pre-fetch uses a small ThreadPoolExecutor (default 6 workers) so the 14
+The pre-fetch uses a small ThreadPoolExecutor (default 6 workers) so the 19
 HTTP requests complete in the time of the single slowest one (~5-10 s) rather
-than the sum of all (~80 s).
+than the sum of all (~100 s).
 """
 
 from __future__ import annotations
@@ -39,6 +39,14 @@ _PREFETCH_TASKS: list[tuple[str, tuple, dict[str, str]]] = [
     ("get_dragon_tiger_board", (), {"ticker": "{ticker}", "curr_date": "{date}"}),
     ("get_lockup_expiry",    (), {"ticker": "{ticker}", "curr_date": "{date}"}),
     ("get_industry_comparison", (), {"ticker": "{ticker}", "curr_date": "{date}"}),
+    # --- Capital flow / chip layer (used by hot_money, fundamentals, lockup) ---
+    ("get_margin_trading",   (), {"ticker": "{ticker}"}),
+    ("get_block_trade",      (), {"ticker": "{ticker}"}),
+    ("get_shareholder_count", (), {"ticker": "{ticker}"}),
+    ("get_research_reports", (), {"ticker": "{ticker}"}),
+    ("get_dividend_history", (), {"ticker": "{ticker}"}),
+    # --- Announcements (used by lockup, fundamentals) ---
+    ("get_cninfo_announcements", (), {"ticker": "{ticker}"}),
 ]
 
 

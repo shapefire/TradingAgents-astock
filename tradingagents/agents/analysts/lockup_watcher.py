@@ -6,6 +6,9 @@ from tradingagents.agents.utils.agent_utils import (
     get_language_instruction,
     get_lockup_expiry,
     get_news,
+    get_shareholder_count,
+    get_block_trade,
+    get_cninfo_announcements,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -22,6 +25,9 @@ def create_lockup_watcher(llm):
             get_news,
             get_fundamentals,
             get_lockup_expiry,
+            get_shareholder_count,
+            get_block_trade,
+            get_cninfo_announcements,
         ]
 
         system_message = (
@@ -43,6 +49,9 @@ def create_lockup_watcher(llm):
             "\n- `get_fundamentals`：获取公司股本结构信息"
             "\n- `get_news(query, start_date, end_date)`：搜索解禁/减持相关新闻和公告"
             "\n- `get_lockup_expiry(ticker, curr_date)`：获取限售解禁日历（历史解禁记录+未来90天待解禁计划，含解禁数量/占比/影响评估）"
+            "\n- `get_shareholder_count(ticker)`：获取股东户数变化（筹码集中度核心指标，户数减少=主力吸筹，可评估解禁后筹码流向）"
+            "\n- `get_block_trade(ticker)`：获取大宗交易记录（解禁前后大宗交易揭示机构/大股东减持意图）"
+            "\n- `get_cninfo_announcements(ticker)`：获取巨潮公告（法定披露渠道，比新闻早1-3天，含股权质押/关联交易/减持计划等风险公告）"
             "\n\n撰写详细的解禁/减持风险评估报告,给出减持压力总体评级(重大压力/中等压力/轻微压力/无明显压力),并估算潜在减持规模和时间窗口。报告末尾附 Markdown 表格列出关键解禁/减持事件、规模和影响评估。"
             "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
             "\n1. 近 6 个月内部人/大股东交易记录（增持/减持/无变动）"

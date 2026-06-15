@@ -42,6 +42,14 @@ from .a_stock import (
     get_dragon_tiger_board as get_astock_dragon_tiger_board,
     get_lockup_expiry as get_astock_lockup_expiry,
     get_industry_comparison as get_astock_industry_comparison,
+    get_margin_trading as get_astock_margin_trading,
+    get_block_trade as get_astock_block_trade,
+    get_shareholder_count as get_astock_shareholder_count,
+    get_research_reports as get_astock_research_reports,
+    get_dividend_history as get_astock_dividend_history,
+    get_daily_dragon_tiger as get_astock_daily_dragon_tiger,
+    get_northbound_stock_holdings as get_astock_northbound_stock_holdings,
+    get_cninfo_announcements as get_astock_cninfo_announcements,
 )
 
 # Configuration and routing logic
@@ -89,6 +97,18 @@ TOOLS_CATEGORIES = {
             "get_dragon_tiger_board",
             "get_lockup_expiry",
             "get_industry_comparison",
+        ]
+    },
+    "capital_flow": {
+        "description": "Capital flow & chip layer (margin, block trade, shareholder, dividends)",
+        "tools": [
+            "get_margin_trading",
+            "get_block_trade",
+            "get_shareholder_count",
+            "get_research_reports",
+            "get_dividend_history",
+            "get_daily_dragon_tiger",
+            "get_northbound_stock_holdings",
         ]
     }
 }
@@ -174,6 +194,31 @@ VENDOR_METHODS = {
     },
     "get_industry_comparison": {
         "a_stock": get_astock_industry_comparison,
+    },
+    # capital_flow (A-stock only)
+    "get_margin_trading": {
+        "a_stock": get_astock_margin_trading,
+    },
+    "get_block_trade": {
+        "a_stock": get_astock_block_trade,
+    },
+    "get_shareholder_count": {
+        "a_stock": get_astock_shareholder_count,
+    },
+    "get_research_reports": {
+        "a_stock": get_astock_research_reports,
+    },
+    "get_dividend_history": {
+        "a_stock": get_astock_dividend_history,
+    },
+    "get_daily_dragon_tiger": {
+        "a_stock": get_astock_daily_dragon_tiger,
+    },
+    "get_northbound_stock_holdings": {
+        "a_stock": get_astock_northbound_stock_holdings,
+    },
+    "get_cninfo_announcements": {
+        "a_stock": get_astock_cninfo_announcements,
     },
 }
 

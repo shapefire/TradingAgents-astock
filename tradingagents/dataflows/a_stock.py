@@ -7,7 +7,8 @@ Data sources:
 - mootdx (TCP 7709): OHLCV K-lines, financial snapshots, F10 text
 - Tencent Finance (HTTP GBK): PE/PB/market cap/turnover
 - 东方财富 push2 / datacenter-web (direct HTTP): stock info, dragon-tiger, lockup,
-  fund flow, concept blocks (V3.2.2 replaces Baidu PAE), industry comparison
+  fund flow, concept blocks, industry comparison, margin trading, block trades,
+  shareholder count, research reports, dividends
 - 新浪财经 (direct HTTP): K-line fallback, financial statements
 - 同花顺 (direct HTTP): consensus EPS, hot stocks, northbound capital flow
 
@@ -15,6 +16,16 @@ V3.2.2 changes (aligned with a-stock-data SKILL.md):
 - Concept blocks: Baidu PAE getrelatedblock → 东财 slist API (spt=3)
 - Global news: CLS wire offline (cls.cn migrated to Next.js) → Eastmoney 7x24 only
 - Sina financial reports: Fixed report_list parsing structure
+- Fund flow: Extended from 20 to 120 trading days
+
+New endpoints (V3.2.2 additions):
+- get_margin_trading: 融资融券明细 (leverage sentiment indicator)
+- get_block_trade: 大宗交易 (institutional intent, premium/discount signals)
+- get_shareholder_count: 股东户数变化 (chip concentration, accumulation detection)
+- get_research_reports: 研报列表 (institutional ratings, EPS forecasts)
+- get_dividend_history: 分红送转历史 (dividend yield, high bonus/transfer catalyst)
+- get_daily_dragon_tiger: 全市场龙虎榜 (daily full-market summary)
+- get_northbound_stock_holdings: 北向个股持仓 (foreign institutional holdings)
 """
 
 from __future__ import annotations
@@ -1851,7 +1862,7 @@ def get_fund_flow(
                 "/api/qt/stock/fflow/daykline/get"
             )
             params_hist = {
-                "secid": secid, "lmt": 20, "klt": 101,
+                "secid": secid, "lmt": 120, "klt": 101,
                 "fields1": "f1,f2,f3,f7",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57",
             }
@@ -1943,6 +1954,8 @@ def get_dragon_tiger_board(
         lines.append(f"龙虎榜列表查询失败: {e}")
 
     # 2. 最近上榜的买卖席位 — eastmoney datacenter direct HTTP
+    buy_data = []
+    sell_data = []
     try:
         if data:
             latest_date = str(data[0].get("TRADE_DATE", ""))[:10]
@@ -2164,3 +2177,781 @@ def get_industry_comparison(
         lines.append(f"行业对比查询失败: {e}")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 18. Margin Trading (融资融券明细) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+def get_margin_trading(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of days to fetch (default 30)"] = 30,
+) -> str:
+    """Get margin trading data (融资融券明细).
+
+    Returns daily margin balance, margin buying, short selling volumes.
+    Rising margin balance = bullish leveraged conviction.
+    Rising short selling = direct bearish bet.
+
+    Data source: Eastmoney datacenter RPTA_WEB_RZRQ_GGMX.
+    """
+    code = _normalize_ticker(ticker)
+
+    try:
+        data = _eastmoney_datacenter(
+            "RPTA_WEB_RZRQ_GGMX",
+            filter_str=f'(SCODE="{code}")',
+            page_size=page_size,
+            sort_columns="DATE",
+            sort_types="-1",
+        )
+
+        if not data:
+            return f"No margin trading data for {code}"
+
+        lines = [
+            f"# 融资融券明细 | {code}",
+            f"# Source: 东财 datacenter (RPTA_WEB_RZRQ_GGMX)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "日期 | 融资余额(亿) | 融资买入(万) | 融券余额(亿) | 融券卖出(万股)",
+            "--- | --- | --- | --- | ---",
+        ]
+
+        prev_rzye = None
+        for row in data:
+            date_str = str(row.get("DATE", ""))[:10]
+            rzye = row.get("RZYE", 0) or 0
+            rzmre = row.get("RZMRE", 0) or 0
+            rqye = row.get("RQYE", 0) or 0
+            rqmcl = row.get("RQMCL", 0) or 0
+
+            # 计算融资余额环比变化
+            change_str = ""
+            if prev_rzye and prev_rzye > 0:
+                change_pct = (rzye / prev_rzye - 1) * 100
+                change_str = f" ({'+' if change_pct >= 0 else ''}{change_pct:.1f}%)"
+            prev_rzye = rzye
+
+            lines.append(
+                f"  {date_str} "
+                f"| {rzye/1e8:.2f}{change_str} "
+                f"| {rzmre/1e4:.0f} "
+                f"| {rqye/1e8:.4f} "
+                f"| {rqmcl/1e4:.0f}"
+            )
+
+        # 趋势分析
+        if len(data) >= 5:
+            latest = data[0]
+            earliest = data[-1]
+            rzye_latest = latest.get("RZYE", 0) or 0
+            rzye_earliest = earliest.get("RZYE", 0) or 0
+            rqye_latest = latest.get("RQYE", 0) or 0
+            rqye_earliest = earliest.get("RQYE", 0) or 0
+
+            lines.append("")
+            if rzye_earliest > 0:
+                rz_change = (rzye_latest / rzye_earliest - 1) * 100
+                lines.append(f"融资余额变化: {'+' if rz_change >= 0 else ''}{rz_change:.1f}% ({len(data)}日)")
+                if rz_change > 5:
+                    lines.append("Signal: 融资余额持续上升 → 多头杠杆加仓 (bullish)")
+                elif rz_change < -5:
+                    lines.append("Signal: 融资余额持续下降 → 多头去杠杆 (bearish)")
+
+            if rqye_earliest > 0:
+                rq_change = (rqye_latest / rqye_earliest - 1) * 100
+                lines.append(f"融券余额变化: {'+' if rq_change >= 0 else ''}{rq_change:.1f}%")
+                if rq_change > 10:
+                    lines.append("Signal: 融券余额上升 → 空头加仓 (bearish)")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching margin trading for {code}: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# 19. Block Trade (大宗交易) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+def get_block_trade(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of records (default 20)"] = 20,
+) -> str:
+    """Get block trade records (大宗交易).
+
+    Returns deal price, volume, buyer/seller broker names, premium/discount %.
+    Block trades reveal institutional intent:
+    - Premium (溢价) = motivated buyer
+    - Discount (折价) = motivated seller (fund exit signal)
+
+    Data source: Eastmoney datacenter RPT_DATA_BLOCKTRADE.
+    """
+    code = _normalize_ticker(ticker)
+
+    try:
+        data = _eastmoney_datacenter(
+            "RPT_DATA_BLOCKTRADE",
+            filter_str=f'(SECURITY_CODE="{code}")',
+            page_size=page_size,
+            sort_columns="TRADE_DATE",
+            sort_types="-1",
+        )
+
+        if not data:
+            return f"No block trade data for {code}"
+
+        lines = [
+            f"# 大宗交易 | {code}",
+            f"# Source: 东财 datacenter (RPT_DATA_BLOCKTRADE)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "日期 | 成交价 | 收盘价 | 溢价% | 成交量(万股) | 成交额(万) | 买方 | 卖方",
+            "--- | --- | --- | --- | --- | --- | --- | ---",
+        ]
+
+        discount_count = 0
+        premium_count = 0
+        for row in data:
+            date_str = str(row.get("TRADE_DATE", ""))[:10]
+            deal_price = row.get("DEAL_PRICE", 0) or 0
+            close_price = row.get("CLOSE_PRICE", 0) or 0
+            vol = row.get("DEAL_VOLUME", 0) or 0
+            amount = row.get("DEAL_AMT", 0) or 0
+            buyer = (row.get("BUYER_NAME", "") or "")[:15]
+            seller = (row.get("SELLER_NAME", "") or "")[:15]
+
+            # 计算溢价率
+            premium_pct = 0
+            if close_price and close_price > 0:
+                premium_pct = (deal_price / close_price - 1) * 100
+
+            if premium_pct < -1:
+                discount_count += 1
+            elif premium_pct > 1:
+                premium_count += 1
+
+            lines.append(
+                f"  {date_str} "
+                f"| {deal_price:.2f} "
+                f"| {close_price:.2f} "
+                f"| {'+' if premium_pct >= 0 else ''}{premium_pct:.2f}% "
+                f"| {vol/1e4:.0f} "
+                f"| {amount/1e4:.0f} "
+                f"| {buyer} "
+                f"| {seller}"
+            )
+
+        # 分析
+        lines.append("")
+        if discount_count > premium_count and discount_count >= 3:
+            lines.append(
+                f"⚠️ 近期 {discount_count} 笔折价大宗交易 → 机构出逃信号 (bearish)"
+            )
+        elif premium_count > discount_count and premium_count >= 3:
+            lines.append(
+                f"✅ 近期 {premium_count} 笔溢价大宗交易 → 机构抢筹信号 (bullish)"
+            )
+        else:
+            lines.append(f"大宗交易折价{discount_count}笔 / 溢价{premium_count}笔")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching block trades for {code}: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# 20. Shareholder Count Changes (股东户数变化) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+def get_shareholder_count(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of quarters (default 10)"] = 10,
+) -> str:
+    """Get shareholder count changes (股东户数变化).
+
+    Returns quarterly shareholder count, change ratio, avg shares per holder.
+    Key signal: declining count + rising avg shares = chip concentration (筹码集中)
+    = classic institutional accumulation pattern.
+
+    Data source: Eastmoney datacenter RPT_HOLDERNUMLATEST.
+    """
+    code = _normalize_ticker(ticker)
+
+    try:
+        data = _eastmoney_datacenter(
+            "RPT_HOLDERNUMLATEST",
+            filter_str=f'(SECURITY_CODE="{code}")',
+            page_size=page_size,
+            sort_columns="END_DATE",
+            sort_types="-1",
+        )
+
+        if not data:
+            return f"No shareholder count data for {code}"
+
+        lines = [
+            f"# 股东户数变化 | {code}",
+            f"# Source: 东财 datacenter (RPT_HOLDERNUMLATEST)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "日期 | 股东户数 | 变化 | 环比% | 户均持股(万股)",
+            "--- | --- | --- | --- | ---",
+        ]
+
+        prev_count = None
+        for row in data:
+            date_str = str(row.get("END_DATE", ""))[:10]
+            holder_num = row.get("HOLDER_NUM", 0) or 0
+            change_num = row.get("HOLDER_NUM_CHANGE", 0) or 0
+            change_ratio = row.get("HOLDER_NUM_RATIO", 0) or 0
+            avg_shares = row.get("AVG_FREE_SHARES", 0) or 0
+
+            change_str = f"{change_num:+d}" if change_num else "N/A"
+
+            lines.append(
+                f"  {date_str} "
+                f"| {holder_num:,} "
+                f"| {change_str} "
+                f"| {change_ratio:+.1f}% "
+                f"| {avg_shares/1e4:.2f}"
+            )
+            prev_count = holder_num
+
+        # 趋势分析
+        if len(data) >= 2:
+            latest = data[0]
+            earliest = data[-1]
+            count_latest = latest.get("HOLDER_NUM", 0) or 0
+            count_earliest = earliest.get("HOLDER_NUM", 0) or 0
+
+            lines.append("")
+            if count_earliest > 0:
+                total_change = (count_latest / count_earliest - 1) * 100
+                lines.append(
+                    f"股东户数变化: {total_change:+.1f}% "
+                    f"({count_earliest:,} → {count_latest:,})"
+                )
+                if total_change < -10:
+                    lines.append(
+                        "Signal: 股东户数持续减少 → 筹码集中，主力吸筹 (bullish)"
+                    )
+                elif total_change > 10:
+                    lines.append(
+                        "Signal: 股东户数持续增加 → 筹码分散，散户接盘 (bearish)"
+                    )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching shareholder count for {code}: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# 21. Research Report List (研报列表) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+_REPORT_API = "https://reportapi.eastmoney.com/report/list"
+
+
+def get_research_reports(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    max_pages: Annotated[int, "Max pages to fetch (default 2)"] = 2,
+) -> str:
+    """Get broker research reports with ratings and EPS forecasts.
+
+    Returns: title, institution, rating (买入/增持/中性/减持), EPS forecasts.
+    Key signals:
+    - Rating distribution (买入 vs 增持 vs 中性)
+    - Recent rating changes (downgrade = bearish)
+    - EPS forecast trends
+
+    Data source: Eastmoney reportapi (free, no key needed).
+    """
+    code = _normalize_ticker(ticker)
+    all_records = []
+
+    try:
+        for page in range(1, max_pages + 1):
+            params = {
+                "industryCode": "*",
+                "pageSize": "100",
+                "industry": "*",
+                "rating": "*",
+                "ratingChange": "*",
+                "beginTime": "2000-01-01",
+                "endTime": "2030-01-01",
+                "pageNo": str(page),
+                "fields": "",
+                "qType": "0",
+                "orgCode": "",
+                "code": code,
+                "rcode": "",
+                "p": str(page),
+                "pageNum": str(page),
+                "pageNumber": str(page),
+            }
+            r = _em_get(
+                _REPORT_API,
+                params=params,
+                headers={"Referer": "https://data.eastmoney.com/"},
+                timeout=30,
+            )
+            d = r.json()
+            rows = d.get("data") or []
+            if not rows:
+                break
+            all_records.extend(rows)
+            if page >= (d.get("TotalPage", 1) or 1):
+                break
+
+        if not all_records:
+            return f"No research reports found for {code}"
+
+        lines = [
+            f"# 研报列表 | {code}",
+            f"# Source: 东财 reportapi (共 {len(all_records)} 篇)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "日期 | 机构 | 评级 | 标题",
+            "--- | --- | --- | ---",
+        ]
+
+        # 评级统计
+        rating_counts: dict[str, int] = {}
+        eps_forecasts: list[dict] = []
+
+        for rec in all_records[:50]:  # 最近50篇
+            date_str = str(rec.get("publishDate", ""))[:10]
+            org = rec.get("orgSName", "")
+            rating = rec.get("emRatingName", "")
+            title = (rec.get("title", "") or "")[:60]
+
+            rating_counts[rating] = rating_counts.get(rating, 0) + 1
+
+            lines.append(f"  {date_str} | {org} | {rating} | {title}")
+
+            # 收集 EPS 预测
+            this_eps = rec.get("predictThisYearEps")
+            next_eps = rec.get("predictNextYearEps")
+            if this_eps:
+                eps_forecasts.append({
+                    "org": org,
+                    "date": date_str,
+                    "this_year": float(this_eps) if this_eps else 0,
+                    "next_year": float(next_eps) if next_eps else 0,
+                })
+
+        # 评级分布
+        lines.append("")
+        lines.append("## 评级分布")
+        for rating, count in sorted(rating_counts.items(), key=lambda x: -x[1]):
+            if rating:
+                lines.append(f"  {rating}: {count} 篇")
+
+        # EPS 预测汇总
+        if eps_forecasts:
+            lines.append("")
+            lines.append("## 机构 EPS 预测")
+            avg_this = sum(e["this_year"] for e in eps_forecasts) / len(eps_forecasts)
+            avg_next = sum(e["next_year"] for e in eps_forecasts) / len(eps_forecasts)
+            lines.append(
+                f"  今年一致预期 EPS: {avg_this:.4f} "
+                f"(基于 {len(eps_forecasts)} 家机构)"
+            )
+            lines.append(
+                f"  明年一致预期 EPS: {avg_next:.4f}"
+            )
+            if avg_this > 0:
+                cagr = (avg_next / avg_this - 1) * 100
+                lines.append(f"  EPS CAGR: {cagr:.1f}%")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching research reports for {code}: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# 22. Dividend History (分红送转历史) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+def get_dividend_history(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of records (default 10)"] = 10,
+) -> str:
+    """Get dividend and bonus share history (分红送转历史).
+
+    Returns per-share cash dividend, bonus shares, transfer shares.
+    Key signals:
+    - Dividend yield calculation (missing from current system)
+    - High bonus/transfer events (高送转 catalyst)
+
+    Data source: Eastmoney datacenter RPT_SHAREBONUS_DET.
+    """
+    code = _normalize_ticker(ticker)
+
+    try:
+        data = _eastmoney_datacenter(
+            "RPT_SHAREBONUS_DET",
+            filter_str=f'(SECURITY_CODE="{code}")',
+            page_size=page_size,
+            sort_columns="EX_DIVIDEND_DATE",
+            sort_types="-1",
+        )
+
+        if not data:
+            return f"No dividend history for {code}"
+
+        lines = [
+            f"# 分红送转历史 | {code}",
+            f"# Source: 东财 datacenter (RPT_SHAREBONUS_DET)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "除权日 | 每股派息(元) | 每10股送股 | 每10股转增 | 进度",
+            "--- | --- | --- | --- | ---",
+        ]
+
+        total_dividend = 0
+        for row in data:
+            date_str = str(row.get("EX_DIVIDEND_DATE", ""))[:10]
+            bonus_rmb = row.get("PRETAX_BONUS_RMB", 0) or 0
+            bonus_ratio = row.get("BONUS_RATIO", 0) or 0
+            transfer_ratio = row.get("TRANSFER_RATIO", 0) or 0
+            progress = row.get("ASSIGN_PROGRESS", "") or ""
+
+            total_dividend += bonus_rmb
+
+            lines.append(
+                f"  {date_str} "
+                f"| {bonus_rmb:.4f} "
+                f"| {bonus_ratio} "
+                f"| {transfer_ratio} "
+                f"| {progress}"
+            )
+
+        # 汇总
+        lines.append("")
+        if total_dividend > 0:
+            lines.append(f"最近 {len(data)} 次累计每股派息: {total_dividend:.4f} 元")
+        if any((row.get("BONUS_RATIO", 0) or 0) > 0 for row in data):
+            lines.append("⚠️ 存在送股记录 (高送转题材)")
+        if any((row.get("TRANSFER_RATIO", 0) or 0) > 0 for row in data):
+            lines.append("⚠️ 存在转增记录 (高送转题材)")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching dividend history for {code}: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# 23. Full Market Dragon Tiger (全市场龙虎榜) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+def get_daily_dragon_tiger(
+    trade_date: Annotated[str, "YYYY-MM-DD (default today)"] = "",
+    min_net_buy: Annotated[float, "Min net buy in 万 (default no filter)"] = 0,
+) -> str:
+    """Get daily full-market dragon tiger board (全市场龙虎榜).
+
+    Returns all stocks that hit the dragon tiger board on a given day,
+    with reasons, net buy amounts, and turnover rates.
+
+    Data source: Eastmoney datacenter RPT_DAILYBILLBOARD_DETAILSNEW.
+    """
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        data = _eastmoney_datacenter(
+            "RPT_DAILYBILLBOARD_DETAILSNEW",
+            filter_str=(
+                f"(TRADE_DATE>='{trade_date}')"
+                f"(TRADE_DATE<='{trade_date}')"
+            ),
+            page_size=500,
+            sort_columns="BILLBOARD_NET_AMT",
+            sort_types="-1",
+        )
+
+        if not data:
+            return f"无龙虎榜数据（非交易日或盘后未更新）| {trade_date}"
+
+        actual_date = str(data[0].get("TRADE_DATE", ""))[:10]
+
+        lines = [
+            f"# 全市场龙虎榜 | {actual_date}",
+            f"# Source: 东财 datacenter",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "代码 | 名称 | 原因 | 收盘价 | 涨跌% | 净买额(万) | 换手%",
+            "--- | --- | --- | --- | --- | --- | ---",
+        ]
+
+        filtered = []
+        for row in data:
+            net_buy = (row.get("BILLBOARD_NET_AMT") or 0) / 10000
+            if min_net_buy and net_buy < min_net_buy:
+                continue
+            filtered.append({
+                "code": row.get("SECURITY_CODE", ""),
+                "name": row.get("SECURITY_NAME_ABBR", ""),
+                "reason": row.get("EXPLANATION", ""),
+                "close": row.get("CLOSE_PRICE") or 0,
+                "change_pct": round(float(row.get("CHANGE_RATE") or 0), 2),
+                "net_buy": round(net_buy, 1),
+                "turnover": round(float(row.get("TURNOVERRATE") or 0), 2),
+            })
+
+        for s in filtered[:30]:
+            lines.append(
+                f"  {s['code']} | {s['name']} | {s['reason'][:30]} "
+                f"| {s['close']} | {s['change_pct']}% "
+                f"| {s['net_buy']} | {s['turnover']}%"
+            )
+
+        lines.append(f"\n共 {len(filtered)} 条记录")
+
+        # 净买入 TOP5
+        top5 = sorted(filtered, key=lambda x: -x["net_buy"])[:5]
+        if top5 and top5[0]["net_buy"] > 0:
+            lines.append("\n## 净买入 TOP5")
+            for s in top5:
+                lines.append(f"  {s['code']} {s['name']}: 净买{s['net_buy']}万 {s['reason'][:40]}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching daily dragon tiger: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# 24. Northbound Stock Holdings (北向个股持仓) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+def get_northbound_stock_holdings(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+) -> str:
+    """Get northbound capital holdings for individual stock (北向个股持仓).
+
+    Shows how much northbound (HK-SH/SZ) capital holds in a specific stock.
+    Rising holdings = foreign institutional buying = bullish signal.
+
+    Data source: Eastmoney datacenter RPT_MUTUAL_STOCK_NORTHSTA.
+    """
+    code = _normalize_ticker(ticker)
+
+    try:
+        data = _eastmoney_datacenter(
+            "RPT_MUTUAL_STOCK_NORTHSTA",
+            filter_str=f'(SECURITY_CODE="{code}")',
+            page_size=20,
+            sort_columns="TRADE_DATE",
+            sort_types="-1",
+        )
+
+        if not data:
+            return f"No northbound holdings data for {code}"
+
+        lines = [
+            f"# 北向持仓 | {code}",
+            f"# Source: 东财 datacenter (RPT_MUTUAL_STOCK_NORTHSTA)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "日期 | 持股数(万股) | 持股市值(亿) | 持股占比% | 环比变化",
+            "--- | --- | --- | --- | ---",
+        ]
+
+        prev_shares = None
+        for row in data[:15]:
+            date_str = str(row.get("TRADE_DATE", ""))[:10]
+            shares = row.get("SHAREHOLDING_NUM", 0) or 0
+            market_value = row.get("MUTUAL_MARKET_CAP", 0) or 0
+            ratio = row.get("FREESHARES_RATIO", 0) or 0
+
+            change_str = ""
+            if prev_shares and prev_shares > 0:
+                change_pct = (shares / prev_shares - 1) * 100
+                change_str = f"{'+' if change_pct >= 0 else ''}{change_pct:.2f}%"
+            prev_shares = shares
+
+            lines.append(
+                f"  {date_str} "
+                f"| {shares:.2f} "
+                f"| {market_value/1e8:.2f} "
+                f"| {ratio:.2f}% "
+                f"| {change_str}"
+            )
+
+        # 趋势
+        if len(data) >= 2:
+            latest_shares = data[0].get("SHAREHOLDING_NUM", 0) or 0
+            earliest_shares = data[-1].get("SHAREHOLDING_NUM", 0) or 0
+            if earliest_shares > 0:
+                change = (latest_shares / earliest_shares - 1) * 100
+                lines.append(f"\n持仓变化: {change:+.1f}% ({len(data)}日)")
+                if change > 5:
+                    lines.append("Signal: 北向资金持续加仓 (bullish)")
+                elif change < -5:
+                    lines.append("Signal: 北向资金持续减仓 (bearish)")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching northbound holdings for {code}: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# 25. cninfo Announcements (巨潮公告) — V3.2.2 新增
+# ---------------------------------------------------------------------------
+
+# 巨潮 股票→orgId 映射（模块级缓存，首次调用时拉取一次，全程复用）
+_CNINFO_ORGID_MAP: dict[str, str] = {}
+
+
+def _cninfo_orgid(code: str) -> str:
+    """查股票真实 orgId。
+
+    巨潮 orgId 并非统一 `gssx0{code}` 格式（如 601318→9900002221、
+    601398→jjxt0000019、688017→9900041602），硬编码会导致大量股票（尤其 601xxx 段）
+    返回 totalAnnouncement=0、查不到公告。
+    优先动态查官方映射表，查不到再回退硬编码。
+    """
+    global _CNINFO_ORGID_MAP
+    if not _CNINFO_ORGID_MAP:
+        try:
+            r = _requests.get(
+                "http://www.cninfo.com.cn/new/data/szse_stock.json",
+                headers={"User-Agent": _UA},
+                timeout=15,
+            )
+            _CNINFO_ORGID_MAP = {
+                s["code"]: s["orgId"]
+                for s in r.json().get("stockList", [])
+            }
+        except Exception as e:
+            logger.warning("巨潮 orgId 映射表拉取失败，回退硬编码规则: %s", e)
+
+    org = _CNINFO_ORGID_MAP.get(code)
+    if org:
+        return org
+
+    # fallback：老格式（仅部分老股票如 600519/600036 适用）
+    if code.startswith("6"):
+        return f"gssh0{code}"
+    elif code.startswith("8") or code.startswith("4"):
+        return f"gsbj0{code}"
+    return f"gssz0{code}"
+
+
+def _cninfo_ts_to_date(ts) -> str:
+    """巨潮 announcementTime 返回 Unix 毫秒整数，需转换为日期字符串。"""
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+    return str(ts)[:10] if ts else ""
+
+
+def get_cninfo_announcements(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of announcements (default 30)"] = 30,
+) -> str:
+    """Get official company announcements from cninfo (巨潮公告).
+
+    Returns announcement title, type, date, and detail URL.
+    cninfo is the legally binding disclosure channel in China.
+    Many material events appear here 1-3 days before news articles:
+    - 股权质押公告 (equity pledge)
+    - 关联交易公告 (related-party transaction)
+    - 年报/季报 (financial reports)
+    - 股东减持计划 (shareholder reduction plans)
+
+    Data source: cninfo.com.cn (巨潮资讯).
+    """
+    code = _normalize_ticker(ticker)
+
+    try:
+        org_id = _cninfo_orgid(code)
+
+        url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+        payload = {
+            "stock": f"{code},{org_id}",
+            "tabName": "fulltext",
+            "pageSize": str(page_size),
+            "pageNum": "1",
+            "column": "",
+            "category": "",
+            "plate": "",
+            "seDate": "",
+            "searchkey": "",
+            "secid": "",
+            "sortName": "",
+            "sortType": "",
+            "isHLtitle": "true",
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": "https://www.cninfo.com.cn/new/disclosure",
+            "Origin": "https://www.cninfo.com.cn",
+        }
+        r = _requests.post(url, data=payload, headers=headers, timeout=15)
+        d = r.json()
+
+        announcements = d.get("announcements") or []
+        if not announcements:
+            return f"No announcements found for {code}"
+
+        lines = [
+            f"# 巨潮公告 | {code}",
+            f"# Source: cninfo.com.cn (巨潮资讯)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# 共 {len(announcements)} 条公告",
+            "",
+            "日期 | 类型 | 标题",
+            "--- | --- | ---",
+        ]
+
+        # 按类型统计
+        type_counts: dict[str, int] = {}
+        risk_keywords = ["质押", "减持", "担保", "诉讼", "处罚", "违规", "风险"]
+        risk_announcements = []
+
+        for ann in announcements:
+            date_str = _cninfo_ts_to_date(ann.get("announcementTime"))
+            ann_type = ann.get("announcementTypeName", "")
+            title = (ann.get("announcementTitle", "") or "").replace("<em>", "").replace("</em>", "")
+            ann_id = ann.get("announcementId", "")
+
+            type_counts[ann_type] = type_counts.get(ann_type, 0) + 1
+
+            lines.append(f"  {date_str} | {ann_type} | {title[:60]}")
+
+            # 检测风险公告
+            if any(kw in title for kw in risk_keywords):
+                risk_announcements.append({
+                    "date": date_str,
+                    "type": ann_type,
+                    "title": title[:80],
+                })
+
+        # 类型分布
+        lines.append("")
+        lines.append("## 公告类型分布")
+        for ann_type, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+            if ann_type:
+                lines.append(f"  {ann_type}: {count} 条")
+
+        # 风险公告预警
+        if risk_announcements:
+            lines.append("")
+            lines.append("## ⚠️ 风险相关公告")
+            for ra in risk_announcements[:5]:
+                lines.append(f"  {ra['date']} | {ra['type']} | {ra['title']}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching cninfo announcements for {code}: {str(e)}"

@@ -27,6 +27,14 @@ from tradingagents.agents.utils.signal_data_tools import (
     get_dragon_tiger_board,
     get_lockup_expiry,
     get_industry_comparison,
+    get_margin_trading,
+    get_block_trade,
+    get_shareholder_count,
+    get_research_reports,
+    get_dividend_history,
+    get_daily_dragon_tiger,
+    get_northbound_stock_holdings,
+    get_cninfo_announcements,
 )
 
 

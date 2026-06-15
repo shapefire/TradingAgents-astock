@@ -11,6 +11,11 @@ from tradingagents.agents.utils.agent_utils import (
     get_news,
     get_northbound_flow,
     get_stock_data,
+    get_margin_trading,
+    get_block_trade,
+    get_shareholder_count,
+    get_daily_dragon_tiger,
+    get_northbound_stock_holdings,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -32,6 +37,11 @@ def create_hot_money_tracker(llm):
             get_fund_flow,
             get_dragon_tiger_board,
             get_industry_comparison,
+            get_margin_trading,
+            get_block_trade,
+            get_shareholder_count,
+            get_daily_dragon_tiger,
+            get_northbound_stock_holdings,
         ]
 
         system_message = (
@@ -56,9 +66,14 @@ def create_hot_money_tracker(llm):
             "\n- `get_hot_stocks(curr_date)`：获取当日涨停股 + 题材归因 reason tags（同花顺独家）"
             "\n- `get_northbound_flow(curr_date)`：获取北向资金实时分钟级流向（沪股通+深股通累计净买入）"
             "\n- `get_concept_blocks(ticker)`：获取个股所属概念板块/行业分类/地域（百度股市通，含当日涨幅）"
-            "\n- `get_fund_flow(ticker, curr_date)`：获取个股主力/散户资金流向（分钟级实时+20日历史，超大单/大单/中单/小单净流入）"
+            "\n- `get_fund_flow(ticker, curr_date)`：获取个股主力/散户资金流向（分钟级实时+120日历史，超大单/大单/中单/小单净流入）"
             "\n- `get_dragon_tiger_board(ticker, curr_date)`：获取龙虎榜上榜记录、买卖席位明细（营业部）、机构参与情况"
             "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（90个行业涨跌幅/成交额/净流入排名，判断板块轮动）"
+            "\n- `get_margin_trading(ticker)`：获取融资融券明细（融资余额趋势=杠杆情绪，融券余额=空头力量）"
+            "\n- `get_block_trade(ticker)`：获取大宗交易记录（溢价/折价率揭示机构意图，买方/卖方营业部识别）"
+            "\n- `get_shareholder_count(ticker)`：获取股东户数变化（筹码集中度核心指标，户数减少=主力吸筹）"
+            "\n- `get_daily_dragon_tiger(trade_date)`：获取全市场龙虎榜汇总（当日所有上榜股票+净买额排名）"
+            "\n- `get_northbound_stock_holdings(ticker)`：获取北向个股持仓变化（外资机构增减仓信号）"
             "\n\n撰写详细的资金面分析报告，给出资金面总体判断（主力流入/主力流出/资金博弈/无明显信号）和短期资金面信号研判（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总量价信号、资金动向和结论。"
             "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："
             "\n1. 近 5 日成交量变化趋势（放量/缩量/平稳）"

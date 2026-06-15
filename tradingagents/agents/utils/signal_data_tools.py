@@ -153,3 +153,155 @@ def get_industry_comparison(
         str: Industry performance ranking with key metrics
     """
     return route_to_vendor("get_industry_comparison", ticker, curr_date)
+
+
+@tool
+def get_margin_trading(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of days (default 30)"] = 30,
+) -> str:
+    """
+    Retrieve margin trading data (融资融券明细).
+    Shows daily margin balance (融资余额), margin buying (融资买入),
+    short selling (融券余额), and trends.
+    Rising margin balance = bullish leveraged conviction.
+    Rising short selling = direct bearish bet.
+    Args:
+        ticker (str): A-stock code
+        page_size (int): Number of days to fetch
+    Returns:
+        str: Margin trading report with leverage sentiment signal
+    """
+    return route_to_vendor("get_margin_trading", ticker, page_size)
+
+
+@tool
+def get_block_trade(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of records (default 20)"] = 20,
+) -> str:
+    """
+    Retrieve block trade records (大宗交易).
+    Shows deal price, volume, buyer/seller broker names, premium/discount %.
+    Premium (溢价) = motivated buyer; Discount (折价) = motivated seller.
+    Large block trades often precede significant price moves by 1-5 days.
+    Args:
+        ticker (str): A-stock code
+        page_size (int): Number of records to fetch
+    Returns:
+        str: Block trade report with institutional intent signal
+    """
+    return route_to_vendor("get_block_trade", ticker, page_size)
+
+
+@tool
+def get_shareholder_count(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of quarters (default 10)"] = 10,
+) -> str:
+    """
+    Retrieve shareholder count changes (股东户数变化).
+    Shows quarterly shareholder count, change ratio, avg shares per holder.
+    Key signal: declining count + rising avg shares = chip concentration (筹码集中)
+    = classic institutional accumulation pattern.
+    Args:
+        ticker (str): A-stock code
+        page_size (int): Number of quarters to fetch
+    Returns:
+        str: Shareholder count report with chip concentration signal
+    """
+    return route_to_vendor("get_shareholder_count", ticker, page_size)
+
+
+@tool
+def get_research_reports(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    max_pages: Annotated[int, "Max pages (default 2)"] = 2,
+) -> str:
+    """
+    Retrieve broker research reports with ratings and EPS forecasts.
+    Shows title, institution, rating (买入/增持/中性/减持), EPS forecasts.
+    Rating distribution reveals institutional consensus direction.
+    Recent rating downgrades are bearish signals.
+    Args:
+        ticker (str): A-stock code
+        max_pages (int): Max pages to fetch
+    Returns:
+        str: Research report list with rating distribution and EPS consensus
+    """
+    return route_to_vendor("get_research_reports", ticker, max_pages)
+
+
+@tool
+def get_dividend_history(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of records (default 10)"] = 10,
+) -> str:
+    """
+    Retrieve dividend and bonus share history (分红送转历史).
+    Shows per-share cash dividend, bonus shares, transfer shares.
+    Enables dividend yield calculation and high bonus/transfer catalyst detection.
+    Args:
+        ticker (str): A-stock code
+        page_size (int): Number of records to fetch
+    Returns:
+        str: Dividend history with yield and bonus/transfer events
+    """
+    return route_to_vendor("get_dividend_history", ticker, page_size)
+
+
+@tool
+def get_daily_dragon_tiger(
+    trade_date: Annotated[str, "YYYY-MM-DD (default today)"] = "",
+    min_net_buy: Annotated[float, "Min net buy in 万 (default 0)"] = 0,
+) -> str:
+    """
+    Retrieve daily full-market dragon tiger board (全市场龙虎榜).
+    Shows all stocks that hit LHB on a given day with reasons,
+    net buy amounts, and turnover rates. Useful for sector-wide hot money context.
+    Args:
+        trade_date (str): YYYY-MM-DD, empty for today
+        min_net_buy (float): Minimum net buy amount in 万 to filter
+    Returns:
+        str: Full market LHB summary with top net buyers
+    """
+    return route_to_vendor("get_daily_dragon_tiger", trade_date, min_net_buy)
+
+
+@tool
+def get_northbound_stock_holdings(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+) -> str:
+    """
+    Retrieve northbound capital holdings for individual stock (北向个股持仓).
+    Shows how much HK-SH/SZ capital holds in a specific stock.
+    Rising holdings = foreign institutional buying = bullish signal.
+    Args:
+        ticker (str): A-stock code
+    Returns:
+        str: Northbound holdings report with trend signal
+    """
+    return route_to_vendor("get_northbound_stock_holdings", ticker)
+
+
+@tool
+def get_cninfo_announcements(
+    ticker: Annotated[str, "A-stock code (e.g. 688017)"],
+    page_size: Annotated[int, "Number of announcements (default 30)"] = 30,
+) -> str:
+    """
+    Retrieve official company announcements from cninfo (巨潮公告).
+    cninfo is the legally binding disclosure channel in China.
+    Many material events appear here 1-3 days before news articles:
+    - 股权质押公告 (equity pledge)
+    - 关联交易公告 (related-party transaction)
+    - 年报/季报 (financial reports)
+    - 股东减持计划 (shareholder reduction plans)
+    Risk announcements (质押/减持/担保/诉讼/处罚) are highlighted.
+    Args:
+        ticker (str): A-stock code
+        page_size (int): Number of announcements to fetch
+    Returns:
+        str: Announcement list with type distribution and risk alerts
+    """
+    return route_to_vendor("get_cninfo_announcements", ticker, page_size)
