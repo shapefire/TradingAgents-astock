@@ -23,18 +23,35 @@
 | 财联社 cls.cn | HTTP | 全球财经快讯 |
 | 百度股市通 | HTTP (gushitong.baidu) | 概念板块归属（资金流已迁移至东财push2） |
 
-### Agent 角色（7 个）
-原版 4 个（市场/情绪/新闻/基本面）+ A 股特化 3 个（政策分析师/游资追踪/解禁监控）
+### Agent 角色（8 个）
+原版 4 个（市场/情绪/新闻/基本面）+ A 股特化 4 个（政策分析师/游资追踪/解禁监控/短线博弈分析师）
 
 ### 关键路径
 - `tradingagents/dataflows/a_stock.py` — A 股数据 vendor，所有数据获取入口
 - `tradingagents/dataflows/utils.py` — `safe_ticker_component` 路径安全校验 + 中文 ticker 自动解析
-- `tradingagents/agents/` — 7 个 Analyst + Bull/Bear 辩论逻辑
+- `tradingagents/dataflows/interface.py` — vendor 路由 + VENDOR_METHODS 注册
+- `tradingagents/agents/` — 8 个 Analyst + Bull/Bear 辩论逻辑
+- `tradingagents/agents/analysts/short_term_analyst.py` — 短线博弈分析师 Agent
+- `tradingagents/agents/utils/signal_data_tools.py` — @tool 包装层（含 5 个短线工具）
 - `web/` — Streamlit Web UI
 - `cli/` — CLI 入口
 
 ### 中文股票名解析链路
 用户/LLM 输入 → `safe_ticker_component` 检测中文 → `resolve_ticker()` → `_build_name_code_map()`（mootdx 全市场映射，缓存）→ 返回 6 位代码
+
+### 短线交易能力扩展（v0.2.14）
+5 个短线决策支撑接口 + 1 个短线博弈分析师 Agent，位于 `a_stock.py` 底层 + `signal_data_tools.py` @tool 包装层：
+
+| 接口 | 功能 | 数据源 |
+|------|------|--------|
+| `get_consecutive_limit_stats(trade_date)` | 连板梯队统计 + 情绪量化（涨停分布/封板质量/情绪阶段/冰点确认） | 同花顺 getharden + mootdx K线 |
+| `get_theme_heat(trade_date)` | 题材热度排名（热度评分/趋势/生命周期/辨识度/龙头状态） | 同花顺 getharden + mootdx |
+| `get_first_board_screen(trade_date)` | 首板筛选 + 二板预期（七因子评分：封单/纯正度/量价/股性/市值） | 同花顺 + mootdx + 东财 push2 |
+| `get_high_board_status(trade_date)` | 高标股状态（分歧度/断板风险/累计换手/板块效应） | mootdx + 东财 push2 |
+| `get_leader_identification(trade_date, theme)` | 龙头识别 + 卡位分析（龙头评分/卡位检测/补涨龙/新龙头区分） | 同花顺 + mootdx |
+
+短线工具仅支持 `a_stock` vendor，注册在 `VENDOR_METHODS["short_term_data"]` 分类下。
+Agent 工厂函数 `create_short_term_analyst(llm)` 在 `agents/analysts/short_term_analyst.py`，绑定 7 个工具（2 共享 + 5 短线）。
 
 ## 已知问题与注意事项
 

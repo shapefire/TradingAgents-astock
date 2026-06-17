@@ -31,6 +31,7 @@ _ANALYST_SECTIONS = [
     ("policy_report", "🏛️ 政策分析"),
     ("hot_money_report", "🔥 游资追踪"),
     ("lockup_report", "🔒 解禁/减持"),
+    ("short_term_report", "⚡ 短线博弈"),
 ]
 
 

@@ -27,7 +27,7 @@ class GraphSetup:
         self.conditional_logic = conditional_logic
 
     def setup_graph(
-        self, selected_analysts=["market", "social", "news", "fundamentals", "policy", "hot_money", "lockup"]
+        self, selected_analysts=["market", "social", "news", "fundamentals", "policy", "hot_money", "lockup", "short_term"]
     ):
         """Set up and compile the agent workflow graph.
 
@@ -40,6 +40,7 @@ class GraphSetup:
                 - "policy": Policy analyst (A-stock specific)
                 - "hot_money": Hot money / capital flow tracker (A-stock specific)
                 - "lockup": Lockup expiry / reduction watcher (A-stock specific)
+                - "short_term": Short-term trading analyst (A-stock specific)
         """
         if len(selected_analysts) == 0:
             raise ValueError("Trading Agents Graph Setup Error: no analysts selected!")
@@ -97,6 +98,13 @@ class GraphSetup:
             )
             delete_nodes["lockup"] = create_msg_delete()
             tool_nodes["lockup"] = self.tool_nodes["lockup"]
+
+        if "short_term" in selected_analysts:
+            analyst_nodes["short_term"] = create_short_term_analyst(
+                self.quick_thinking_llm
+            )
+            delete_nodes["short_term"] = create_msg_delete()
+            tool_nodes["short_term"] = self.tool_nodes["short_term"]
 
         # Create quality gate node
         quality_gate_node = create_quality_gate(self.quick_thinking_llm)

@@ -26,6 +26,7 @@ from tradingagents.agents.utils.agent_states import (
 )
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.interface import clear_vendor_cache
+from tradingagents.dataflows.a_stock import clear_session_cache
 from tradingagents.dataflows.prefetch import prefetch_vendor_data
 
 # Import the new abstract tool methods from agent_utils
@@ -47,6 +48,11 @@ from tradingagents.agents.utils.agent_utils import (
     get_dragon_tiger_board,
     get_lockup_expiry,
     get_industry_comparison,
+    get_consecutive_limit_stats,
+    get_theme_heat,
+    get_first_board_screen,
+    get_high_board_status,
+    get_leader_identification,
 )
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
@@ -62,7 +68,7 @@ class TradingAgentsGraph:
 
     def __init__(
         self,
-        selected_analysts=["market", "social", "news", "fundamentals", "policy", "hot_money", "lockup"],
+        selected_analysts=["market", "social", "news", "fundamentals", "policy", "hot_money", "lockup", "short_term"],
         debug=False,
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,
@@ -229,6 +235,17 @@ class TradingAgentsGraph:
                     get_lockup_expiry,
                 ]
             ),
+            "short_term": ToolNode(
+                [
+                    get_stock_data,
+                    get_concept_blocks,
+                    get_consecutive_limit_stats,
+                    get_theme_heat,
+                    get_first_board_screen,
+                    get_high_board_status,
+                    get_leader_identification,
+                ]
+            ),
         }
 
     def _fetch_returns(
@@ -316,6 +333,7 @@ class TradingAgentsGraph:
         # never served.  Individual tool calls and prefetch_vendor_data() will
         # populate this cache during the run.
         clear_vendor_cache()
+        clear_session_cache()  # 清除内部函数的会话级缓存
 
         self.ticker = company_name
 
@@ -413,6 +431,7 @@ class TradingAgentsGraph:
             "policy_report": final_state.get("policy_report", ""),
             "hot_money_report": final_state.get("hot_money_report", ""),
             "lockup_report": final_state.get("lockup_report", ""),
+            "short_term_report": final_state.get("short_term_report", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],

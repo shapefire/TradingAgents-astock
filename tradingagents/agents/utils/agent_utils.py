@@ -35,6 +35,11 @@ from tradingagents.agents.utils.signal_data_tools import (
     get_daily_dragon_tiger,
     get_northbound_stock_holdings,
     get_cninfo_announcements,
+    get_consecutive_limit_stats,
+    get_theme_heat,
+    get_first_board_screen,
+    get_high_board_status,
+    get_leader_identification,
 )
 
 

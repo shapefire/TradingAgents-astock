@@ -1,0 +1,102 @@
+{
+  "limitup": {
+    "trade_date": "2026-06-13",
+    "eastmoney_datacenter": {
+      "available": false
+    },
+    "eastmoney_xuangu": {
+      "available": true,
+      "fields": [
+        "SECUCODE",
+        "SECURITY_CODE",
+        "SECURITY_NAME_ABBR",
+        "CHANGE_RATE",
+        "NEW_PRICE",
+        "OPEN_PRICE",
+        "HIGH_PRICE",
+        "LOW_PRICE",
+        "VOLUME_RATIO",
+        "TURNOVERRATE",
+        "PE9",
+        "TOTAL_MARKET_CAP",
+        "FREE_CAP",
+        "DEAL_AMOUNT",
+        "MAX_TRADE_DATE"
+      ],
+      "records": 10,
+      "sample": {
+        "SECUCODE": "920126.BJ",
+        "SECURITY_CODE": "920126",
+        "SECURITY_NAME_ABBR": "永大股份",
+        "CHANGE_RATE": 126.96,
+        "NEW_PRICE": 17.68,
+        "OPEN_PRICE": 19.01,
+        "HIGH_PRICE": 23.11,
+        "LOW_PRICE": 17.56,
+        "VOLUME_RATIO": "-",
+        "TURNOVERRATE": 85.01,
+        "PE9": 31.41441305,
+        "TOTAL_MARKET_CAP": 3289894400,
+        "FREE_CAP": 789730240,
+        "DEAL_AMOUNT": 749364696.04,
+        "MAX_TRADE_DATE": "2026-06-15"
+      }
+    },
+    "ths_getharden": {
+      "available": true,
+      "fields": [
+        "id",
+        "name",
+        "code",
+        "reason",
+        "date",
+        "market"
+      ],
+      "records": 160,
+      "sample": {
+        "id": 90288930,
+        "name": "中远海能",
+        "code": "600026",
+        "reason": "LNG运输+一季报增长+央企",
+        "date": "2026-06-15",
+        "market": 17
+      }
+    },
+    "mootdx_kline": {
+      "available": true,
+      "test_results": [
+        {
+          "code": "600026",
+          "prev_close": 17.5,
+          "current_close": 19.25,
+          "limit_up_price": 19.25,
+          "is_limit_up": "True",
+          "consecutive_limit_days": 1
+        },
+        {
+          "code": "301566",
+          "prev_close": 30.53,
+          "current_close": 36.64,
+          "limit_up_price": 33.58,
+          "is_limit_up": "False",
+          "consecutive_limit_days": 0
+        },
+        {
+          "code": "301526",
+          "prev_close": 28.44,
+          "current_close": 34.13,
+          "limit_up_price": 31.28,
+          "is_limit_up": "False",
+          "consecutive_limit_days": 0
+        }
+      ]
+    }
+  },
+  "limitdown": null,
+  "reason_quality": null,
+  "seal_amount": null,
+  "market_breadth": {
+    "limitup_count": 0,
+    "limitdown_count": 0
+  }
+}

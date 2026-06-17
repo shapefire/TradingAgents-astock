@@ -1,4 +1,8 @@
+import inspect
+import logging
 from typing import Annotated
+
+logger = logging.getLogger(__name__)
 
 # Import from vendor-specific modules
 from .y_finance import (
@@ -50,6 +54,11 @@ from .a_stock import (
     get_daily_dragon_tiger as get_astock_daily_dragon_tiger,
     get_northbound_stock_holdings as get_astock_northbound_stock_holdings,
     get_cninfo_announcements as get_astock_cninfo_announcements,
+    get_consecutive_limit_stats as get_astock_consecutive_limit_stats,
+    get_theme_heat as get_astock_theme_heat,
+    get_first_board_screen as get_astock_first_board_screen,
+    get_high_board_status as get_astock_high_board_status,
+    get_leader_identification as get_astock_leader_identification,
 )
 
 # Configuration and routing logic
@@ -109,6 +118,16 @@ TOOLS_CATEGORIES = {
             "get_dividend_history",
             "get_daily_dragon_tiger",
             "get_northbound_stock_holdings",
+        ]
+    },
+    "short_term_data": {
+        "description": "Short-term trading signals (limit-up boards, theme heat, leader identification)",
+        "tools": [
+            "get_consecutive_limit_stats",
+            "get_theme_heat",
+            "get_first_board_screen",
+            "get_high_board_status",
+            "get_leader_identification",
         ]
     }
 }
@@ -220,6 +239,22 @@ VENDOR_METHODS = {
     "get_cninfo_announcements": {
         "a_stock": get_astock_cninfo_announcements,
     },
+    # short_term_data (A-stock only)
+    "get_consecutive_limit_stats": {
+        "a_stock": get_astock_consecutive_limit_stats,
+    },
+    "get_theme_heat": {
+        "a_stock": get_astock_theme_heat,
+    },
+    "get_first_board_screen": {
+        "a_stock": get_astock_first_board_screen,
+    },
+    "get_high_board_status": {
+        "a_stock": get_astock_high_board_status,
+    },
+    "get_leader_identification": {
+        "a_stock": get_astock_leader_identification,
+    },
 }
 
 def get_category_for_method(method: str) -> str:
@@ -262,16 +297,60 @@ def clear_vendor_cache() -> None:
     _vendor_cache = {}
 
 
+def _resolve_impl_func(method: str, vendor: str):
+    """Resolve the actual callable for a given method+vendor."""
+    vendor_impl = VENDOR_METHODS[method][vendor]
+    return vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
+
+
+def _normalize_cache_key(method: str, args: tuple, kwargs: dict) -> tuple:
+    """Build a canonical cache key from positional + keyword args.
+
+    Prefetch calls use keyword args (``route_to_vendor("get_fundamentals",
+    (), {"ticker": t, "curr_date": d})``) while @tool wrappers use positional
+    args (``route_to_vendor("get_fundamentals", t, d)``).  Without
+    normalization the two produce different cache keys and the prefetch result
+    is wasted.
+
+    The function inspects the primary vendor implementation's signature to
+    bind positional args to parameter names, then builds a single canonical
+    key of ``(method, frozenset_of_bound_arguments)``.
+    """
+    if method not in VENDOR_METHODS:
+        return (method, args, tuple(sorted(kwargs.items())))
+
+    # Get the primary vendor's implementation to inspect its signature
+    category = get_category_for_method(method)
+    vendor_config = get_vendor(category, method)
+    primary_vendor = vendor_config.split(',')[0].strip()
+    if primary_vendor not in VENDOR_METHODS.get(method, {}):
+        return (method, args, tuple(sorted(kwargs.items())))
+
+    impl_func = _resolve_impl_func(method, primary_vendor)
+
+    # Unwrap if wrapped (e.g. by @tool or other decorators)
+    raw = getattr(impl_func, '__wrapped__', impl_func)
+
+    try:
+        sig = inspect.signature(raw)
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        # Use frozenset for order-independent comparison
+        return (method, frozenset(bound.arguments.items()))
+    except (TypeError, ValueError):
+        # Fallback: if we can't inspect the signature, use the original key
+        return (method, args, tuple(sorted(kwargs.items())))
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with caching and fallback support.
 
-    Results are cached per (method, args, kwargs) tuple so that duplicate calls
-    within the same analysis run (e.g. get_news called by 5 different analysts)
-    return instantly without redundant HTTP requests.  The cache is cleared at
+    Results are cached per normalized (method, bound-args) tuple so that
+    duplicate calls — whether via prefetch (keyword args) or @tool wrappers
+    (positional args) — hit the same cache entry.  The cache is cleared at
     the start of each propagate() call.
     """
-    # Build cache key — all tool args are str/int/bool (hashable)
-    cache_key = (method, args, tuple(sorted(kwargs.items())))
+    cache_key = _normalize_cache_key(method, args, kwargs)
     if cache_key in _vendor_cache:
         return _vendor_cache[cache_key]
 
@@ -301,6 +380,14 @@ def route_to_vendor(method: str, *args, **kwargs):
             _vendor_cache[cache_key] = result
             return result
         except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+            continue  # Rate limits trigger fallback to next vendor
+        except Exception:
+            # Non-rate-limit errors (network, proxy, timeout) — try next vendor
+            # rather than crashing the entire analysis pipeline.
+            logger.debug("Vendor %s failed for %s, trying next", vendor, method)
+            continue
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    # All vendors failed — return a graceful empty result instead of raising,
+    # so the analysis pipeline continues with missing data rather than blocking.
+    logger.warning("All vendors failed for %s, returning empty result", method)
+    return ""

@@ -47,6 +47,12 @@ _PREFETCH_TASKS: list[tuple[str, tuple, dict[str, str]]] = [
     ("get_dividend_history", (), {"ticker": "{ticker}"}),
     # --- Announcements (used by lockup, fundamentals) ---
     ("get_cninfo_announcements", (), {"ticker": "{ticker}"}),
+    # --- Short-term trading signals (used by short_term analyst) ---
+    ("get_consecutive_limit_stats", (), {"trade_date": "{date}"}),
+    ("get_theme_heat", (), {"trade_date": "{date}"}),
+    ("get_first_board_screen", (), {"trade_date": "{date}"}),
+    ("get_high_board_status", (), {"trade_date": "{date}"}),
+    ("get_leader_identification", (), {"trade_date": "{date}", "theme": ""}),
 ]
 
 

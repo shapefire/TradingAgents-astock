@@ -305,3 +305,90 @@ def get_cninfo_announcements(
         str: Announcement list with type distribution and risk alerts
     """
     return route_to_vendor("get_cninfo_announcements", ticker, page_size)
+
+
+@tool
+def get_consecutive_limit_stats(
+    trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
+) -> str:
+    """
+    Retrieve consecutive limit-up board statistics and market emotion metrics.
+    Returns board distribution (连板梯队), seal quality, yesterday's limit-up performance,
+    emotion phase judgment (冰点/回暖/升温/高潮/退潮), and overall emotion score.
+    Key for short-term traders to gauge market temperature.
+    Args:
+        trade_date (str): Date in YYYY-MM-DD format
+    Returns:
+        str: Consecutive limit-up stats with emotion phase and health score
+    """
+    return route_to_vendor("get_consecutive_limit_stats", trade_date)
+
+
+@tool
+def get_theme_heat(
+    trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
+) -> str:
+    """
+    Retrieve theme/sector heat tracking with trend and phase analysis.
+    Returns top themes ranked by heat score, each with: heat score, trend direction,
+    lifecycle phase (启动/加速/分歧/退潮), recognition score, and leader status.
+    Critical for identifying which themes are gaining momentum.
+    Args:
+        trade_date (str): Date in YYYY-MM-DD format
+    Returns:
+        str: Theme heat ranking with trend, phase, and leader analysis
+    """
+    return route_to_vendor("get_theme_heat", trade_date)
+
+
+@tool
+def get_first_board_screen(
+    trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
+) -> str:
+    """
+    Retrieve first-board (首板) stock screening with second-board probability scoring.
+    Returns today's first limit-up stocks ranked by second-board expectation score.
+    Each stock includes: seal quality, theme purity, volume-price match, and composite score.
+    Useful for identifying high-probability breakout candidates.
+    Args:
+        trade_date (str): Date in YYYY-MM-DD format
+    Returns:
+        str: First-board screening report with second-board expectation scores
+    """
+    return route_to_vendor("get_first_board_screen", trade_date)
+
+
+@tool
+def get_high_board_status(
+    trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
+) -> str:
+    """
+    Retrieve high-board (高标股) status monitoring for market leaders.
+    Returns the highest consecutive limit-up stocks with: divergence score,
+    break-board risk level, cumulative turnover, and sector effect analysis.
+    Key for tracking whether market height is expanding or contracting.
+    Args:
+        trade_date (str): Date in YYYY-MM-DD format
+    Returns:
+        str: High-board status report with risk assessment and sector effects
+    """
+    return route_to_vendor("get_high_board_status", trade_date)
+
+
+@tool
+def get_leader_identification(
+    trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
+    theme: Annotated[str, "Theme name to analyze (empty for all themes)"] = "",
+) -> str:
+    """
+    Retrieve leader (龙头) identification and card-position (卡位) analysis.
+    Returns leader candidates ranked by leader score, card-position detection,
+    deputy leader (补涨龙) identification, and new leader vs deputy distinction.
+    Essential for understanding intra-theme hierarchy and rotation.
+    Args:
+        trade_date (str): Date in YYYY-MM-DD format
+        theme (str): Specific theme to analyze, empty string for all themes
+    Returns:
+        str: Leader identification report with scoring and position analysis
+    """
+    return route_to_vendor("get_leader_identification", trade_date, theme)
