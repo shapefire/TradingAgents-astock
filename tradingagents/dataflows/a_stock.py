@@ -573,14 +573,26 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
     os.makedirs(cache_dir, exist_ok=True)
 
     cache_file = os.path.join(cache_dir, f"{code}-astock-daily.csv")
+    cutoff = pd.to_datetime(curr_date)
 
     if os.path.exists(cache_file):
         mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
         if mtime.date() == datetime.now().date():
             data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
             data["Date"] = pd.to_datetime(data["Date"])
-            cutoff = pd.to_datetime(curr_date)
-            return data[data["Date"] <= cutoff]
+            filtered = data[data["Date"] <= cutoff]
+            # 当日缓存可能在盘中生成，缺少 curr_date 的 K 线，导致连板少算 1 天
+            if (
+                not filtered.empty
+                and filtered["Date"].max().normalize() >= cutoff.normalize()
+            ):
+                return filtered
+            logger.debug(
+                "OHLCV cache stale for %s (need %s, have %s), refetching",
+                code,
+                curr_date,
+                filtered["Date"].max().strftime("%Y-%m-%d") if not filtered.empty else "none",
+            )
 
     # Fetch from mootdx — 800 daily bars (~3 years of trading days)
     try:
@@ -3020,16 +3032,40 @@ def _get_limitup_stocks_ths(trade_date: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# P1-02: mootdx涨停判断
+# P1-02: 涨停价 / 连板判断（支持 5%/10%/20%/30% 多档涨跌幅）
 # ---------------------------------------------------------------------------
+
+_LIMIT_UP_RATIOS = (0.05, 0.10, 0.20, 0.30)
+_LIMIT_UP_TOLERANCE = 0.015
+
+
+def _limit_up_price(prev_close: float, ratio: float) -> float:
+    """计算涨停价（四舍五入到分）。"""
+    return round(prev_close * (1 + ratio), 2)
+
+
+def _match_limit_up_ratio(prev_close: float, close: float) -> float | None:
+    """根据收盘价匹配涨停幅度，无法匹配时返回 None。"""
+    if prev_close <= 0:
+        return None
+    matches = [
+        ratio
+        for ratio in _LIMIT_UP_RATIOS
+        if abs(close - _limit_up_price(prev_close, ratio)) <= _LIMIT_UP_TOLERANCE
+    ]
+    if not matches:
+        return None
+    pct = (close / prev_close - 1) * 100
+    return min(matches, key=lambda r: abs(pct - r * 100))
+
 
 def _detect_limitup_from_kline(code: str, trade_date: str) -> dict:
     """从K线数据判断个股是否涨停。
 
     逻辑:
     1. 获取当日K线（OHLCV）
-    2. 计算涨停价 = 前收盘 * 1.1（四舍五入到分）
-    3. 如果收盘价 == 涨停价 → 涨停
+    2. 按 5%/10%/20%/30% 匹配涨停价（ST/主板/创业板/北交所）
+    3. 如果收盘价命中涨停价 → 涨停
     4. 如果开盘价 == 涨停价 且 收盘价 == 涨停价 且 最高价 == 最低价 → 一字板
 
     返回:
@@ -3048,13 +3084,13 @@ def _detect_limitup_from_kline(code: str, trade_date: str) -> dict:
         curr_high = float(last_row["High"])
         curr_low = float(last_row["Low"])
 
-        # 涨停价 = 前收盘 * 1.1，四舍五入到分
-        limit_price = round(prev_close * 1.1, 2)
-        is_limit_up = abs(curr_close - limit_price) < 0.01
+        ratio = _match_limit_up_ratio(prev_close, curr_close)
+        is_limit_up = ratio is not None
+        limit_price = _limit_up_price(prev_close, ratio) if ratio else 0.0
         # 一字板：开盘=收盘=涨停价，且最高=最低（无波动）
         is_yizi = (
             is_limit_up
-            and abs(curr_open - limit_price) < 0.01
+            and abs(curr_open - limit_price) <= _LIMIT_UP_TOLERANCE
             and abs(curr_high - curr_low) < 0.01
         )
 
@@ -3078,7 +3114,7 @@ def _calculate_consecutive_days(code: str, trade_date: str) -> int:
 
     逻辑:
     1. 从trade_date开始，逐日检查是否涨停
-    2. 如果当日收盘价 == 涨停价，连板天数+1
+    2. 按 5%/10%/20%/30% 匹配涨停价，命中则连板天数+1
     3. 如果中断，停止计数
 
     返回: 连板天数（int），0表示当日未涨停
@@ -3094,8 +3130,7 @@ def _calculate_consecutive_days(code: str, trade_date: str) -> int:
         for i in range(len(df) - 1, 0, -1):
             prev_close = float(df.iloc[i - 1]["Close"])
             curr_close = float(df.iloc[i]["Close"])
-            limit_price = round(prev_close * 1.1, 2)
-            if abs(curr_close - limit_price) < 0.01:
+            if _match_limit_up_ratio(prev_close, curr_close) is not None:
                 consecutive += 1
             else:
                 break
@@ -3114,6 +3149,19 @@ def _calculate_consecutive_days(code: str, trade_date: str) -> int:
 def _is_bse_code(code: str) -> bool:
     """判断是否为北交所股票代码（8/9 开头的 6 位代码，mootdx 不支持）。"""
     return len(code) == 6 and code[0] in ("8", "9") and not code.startswith("900")
+
+
+def _is_st_stock(name: str) -> bool:
+    """判断是否为 ST/*ST 股票（5% 涨跌幅，不参与市场高度板统计）。"""
+    if not name:
+        return False
+    upper = name.upper()
+    return "ST" in upper or name.startswith("*")
+
+
+def _non_st_limitup_stocks(limitup_stocks: list[dict]) -> list[dict]:
+    """过滤 ST 股票，用于市场高度板/高标股统计。"""
+    return [s for s in limitup_stocks if not _is_st_stock(s.get("name", ""))]
 
 
 def _enrich_limitup_stock(stock: dict, trade_date: str, em_quotes: dict) -> dict:
@@ -3358,12 +3406,13 @@ def _estimate_first_limit_time(code: str, trade_date: str, limit_type: str) -> s
         curr_close = float(row["Close"])
         curr_high = float(row["High"])
 
-        # 涨停价估算（前收盘 * 1.1）
         if len(df) >= 2:
             prev_close = float(df.iloc[-2]["Close"])
-            limit_price = round(prev_close * 1.1, 2)
-            if abs(curr_open - limit_price) < 0.01:
-                return "09:30"
+            ratio = _match_limit_up_ratio(prev_close, curr_close)
+            if ratio is not None:
+                limit_price = _limit_up_price(prev_close, ratio)
+                if abs(curr_open - limit_price) <= _LIMIT_UP_TOLERANCE:
+                    return "09:30"
 
         return "10:00"  # 默认盘中涨停
 
@@ -3459,8 +3508,7 @@ def _get_historical_activity(code: str, lookback_days: int = 240) -> float:
         for i in range(start_idx + 1, len(df)):
             prev_close = float(df.iloc[i - 1]["Close"])
             curr_close = float(df.iloc[i]["Close"])
-            limit_price = round(prev_close * 1.1, 2)
-            if abs(curr_close - limit_price) < 0.01:
+            if _match_limit_up_ratio(prev_close, curr_close) is not None:
                 limitup_count += 1
 
         # 评分映射
@@ -4249,8 +4297,16 @@ def _get_board_distribution(limitup_stocks: list[dict]) -> dict:
         board = stock.get("consecutive_days", 1)
         dist[board] = dist.get(board, 0) + 1
 
-    highest = max(dist.keys()) if dist else 0
-    return {"highest_board": highest, "distribution": dist, "total": len(limitup_stocks)}
+    highest_all = max(dist.keys()) if dist else 0
+    non_st = _non_st_limitup_stocks(limitup_stocks)
+    non_st_boards = [s.get("consecutive_days", 0) for s in non_st if s.get("consecutive_days", 0) > 0]
+    highest_board = max(non_st_boards) if non_st_boards else highest_all
+    return {
+        "highest_board": highest_board,
+        "highest_board_including_st": highest_all,
+        "distribution": dist,
+        "total": len(limitup_stocks),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -5607,14 +5663,15 @@ def _get_high_board_stocks(trade_date: str) -> list[dict]:
         if not limitup_stocks:
             return []
 
+        candidates = _non_st_limitup_stocks(limitup_stocks) or limitup_stocks
         max_board = max(
-            (s.get("consecutive_days", 0) for s in limitup_stocks), default=0
+            (s.get("consecutive_days", 0) for s in candidates), default=0
         )
         if max_board <= 0:
             return []
 
         return [
-            s for s in limitup_stocks
+            s for s in candidates
             if s.get("consecutive_days", 0) == max_board
         ]
 
@@ -6833,8 +6890,9 @@ def get_leader_identification(
         )
 
         # 9. 龙头评分
-        # 判断是否市场最高板
-        max_board = max((s.get("consecutive_days", 0) for s in all_limitup), default=0)
+        # 判断是否市场最高板（不含 ST）
+        non_st = _non_st_limitup_stocks(all_limitup) or all_limitup
+        max_board = max((s.get("consecutive_days", 0) for s in non_st), default=0)
         is_market_highest = target_board_num >= max_board and target_board_num > 0
 
         # 判断同板数内是否首板最早

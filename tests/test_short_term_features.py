@@ -6,6 +6,9 @@ from tradingagents.dataflows.a_stock import (
     _get_limitup_stocks_ths,
     _detect_limitup_from_kline,
     _calculate_consecutive_days,
+    _match_limit_up_ratio,
+    _limit_up_price,
+    _load_ohlcv_astock,
     _get_limitup_stocks,
     _get_limitdown_stocks,
     _get_stock_realtime_quote,
@@ -139,6 +142,109 @@ class TestCalculateConsecutiveDays:
         """无效代码应返回0"""
         result = _calculate_consecutive_days("999999", "2026-06-13")
         assert result == 0
+
+
+class TestMatchLimitUpRatio:
+    """涨停幅度匹配（5%/10%/20%/30%）"""
+
+    def test_main_board_10pct(self):
+        assert _match_limit_up_ratio(10.0, 11.0) == 0.10
+
+    def test_st_5pct(self):
+        assert _match_limit_up_ratio(10.0, 10.5) == 0.05
+
+    def test_chinext_20pct(self):
+        assert _match_limit_up_ratio(10.0, 12.0) == 0.20
+
+    def test_not_limit_up(self):
+        assert _match_limit_up_ratio(10.0, 10.8) is None
+
+    def test_limit_price_rounding(self):
+        assert _limit_up_price(13.54, 0.10) == 14.89
+
+
+class TestCalculateConsecutiveDaysWithMockKline:
+    """连板天数：K 线缺失当日 bar 时不应少算（回归测试）"""
+
+    def test_missing_trade_date_bar_undercounts_without_fix(self):
+        """缺少 trade_date 当日 K 线时，3 连板会被误判为 2 连板"""
+        import pandas as pd
+
+        dates = pd.to_datetime(
+            ["2026-06-12", "2026-06-15", "2026-06-16", "2026-06-17"]
+        )
+        df = pd.DataFrame(
+            {
+                "Date": dates,
+                "Open": [16.0, 18.06, 19.87, 21.86],
+                "High": [16.42, 18.06, 19.87, 21.86],
+                "Low": [16.0, 18.06, 19.87, 21.86],
+                "Close": [16.42, 18.06, 19.87, 21.86],
+                "Volume": [100, 100, 100, 100],
+            }
+        )
+        with patch("tradingagents.dataflows.a_stock._load_ohlcv_astock") as mock_load:
+            mock_load.return_value = df
+            assert _calculate_consecutive_days("000777", "2026-06-17") == 3
+
+            truncated = df[df["Date"] < "2026-06-17"]
+            mock_load.return_value = truncated
+            assert _calculate_consecutive_days("000777", "2026-06-17") == 2
+
+
+class TestOhlcvCacheCoversDate:
+    """OHLCV 缓存应覆盖 curr_date，否则需重新拉取"""
+
+    def test_stale_same_day_cache_is_not_used(self, tmp_path):
+        import pandas as pd
+        from tradingagents.dataflows import a_stock
+
+        code = "000777"
+        cache_file = tmp_path / f"{code}-astock-daily.csv"
+        stale = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-06-15", "2026-06-16"]),
+                "Open": [1, 1],
+                "High": [1, 1],
+                "Low": [1, 1],
+                "Close": [1, 1],
+                "Volume": [1, 1],
+            }
+        )
+        stale.to_csv(cache_file, index=False, encoding="utf-8")
+
+        fresh = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-06-15", "2026-06-16", "2026-06-17"]),
+                "Open": [1, 1, 1],
+                "High": [1, 1, 1],
+                "Low": [1, 1, 1],
+                "Close": [1, 1, 1],
+                "Volume": [1, 1, 1],
+            }
+        )
+
+        with patch("tradingagents.dataflows.config.get_config", return_value={"data_cache_dir": str(tmp_path)}), \
+             patch.object(a_stock, "_get_mootdx_client") as mock_client, \
+             patch.object(a_stock, "datetime") as mock_dt:
+            mock_dt.now.return_value = __import__("datetime").datetime(2026, 6, 17, 16, 0, 0)
+            mock_dt.fromtimestamp = __import__("datetime").datetime.fromtimestamp
+            mock_client.return_value.bars.return_value = fresh.rename(
+                columns={
+                    "Date": "datetime",
+                    "Open": "open",
+                    "High": "high",
+                    "Low": "low",
+                    "Close": "close",
+                    "Volume": "volume",
+                }
+            ).set_index("datetime")
+
+            result = a_stock._load_ohlcv_astock(code, "2026-06-17")
+
+        assert len(result) == 3
+        assert result["Date"].max().strftime("%Y-%m-%d") == "2026-06-17"
+        mock_client.return_value.bars.assert_called_once()
 
 
 class TestGetLimitupStocks:
@@ -393,6 +499,16 @@ class TestGetBoardDistribution:
         assert result["highest_board"] == 5
         assert result["distribution"] == {5: 1, 4: 2, 3: 3, 2: 1, 1: 2}
         assert result["total"] == 9
+
+    def test_st_excluded_from_highest_board(self):
+        """ST 连板计入分布，但不参与市场高度板统计"""
+        stocks = [
+            {"code": "600537", "name": "*ST汇智", "consecutive_days": 5},
+            {"code": "000777", "name": "中核科技", "consecutive_days": 3},
+        ]
+        result = _get_board_distribution(stocks)
+        assert result["highest_board"] == 3
+        assert result["highest_board_including_st"] == 5
 
 
 class TestCalculateSealQuality:
