@@ -50,6 +50,7 @@ from .a_stock import (
     get_block_trade as get_astock_block_trade,
     get_shareholder_count as get_astock_shareholder_count,
     get_research_reports as get_astock_research_reports,
+    get_industry_research_reports as get_astock_industry_research_reports,
     get_dividend_history as get_astock_dividend_history,
     get_daily_dragon_tiger as get_astock_daily_dragon_tiger,
     get_northbound_stock_holdings as get_astock_northbound_stock_holdings,
@@ -116,6 +117,7 @@ TOOLS_CATEGORIES = {
             "get_block_trade",
             "get_shareholder_count",
             "get_research_reports",
+            "get_industry_research_reports",
             "get_dividend_history",
             "get_daily_dragon_tiger",
             "get_northbound_stock_holdings",
@@ -229,6 +231,9 @@ VENDOR_METHODS = {
     },
     "get_research_reports": {
         "a_stock": get_astock_research_reports,
+    },
+    "get_industry_research_reports": {
+        "a_stock": get_astock_industry_research_reports,
     },
     "get_dividend_history": {
         "a_stock": get_astock_dividend_history,

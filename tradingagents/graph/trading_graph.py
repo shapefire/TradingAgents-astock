@@ -53,6 +53,9 @@ from tradingagents.agents.utils.agent_utils import (
     get_dragon_tiger_board,
     get_lockup_expiry,
     get_industry_comparison,
+    get_research_reports,
+    get_industry_research_reports,
+    get_dividend_history,
     get_consecutive_limit_stats,
     get_theme_heat,
     get_first_board_screen,
@@ -250,6 +253,9 @@ class TradingAgentsGraph:
                     get_income_statement,
                     get_profit_forecast,
                     get_industry_comparison,
+                    get_research_reports,
+                    get_industry_research_reports,
+                    get_dividend_history,
                 ]
             ),
             "policy": ToolNode(

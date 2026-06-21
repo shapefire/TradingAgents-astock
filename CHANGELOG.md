@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [2026-06-21]
+
+### Changed
+
+- **同步 a-stock-data v3.2.4（[shapefire/a-stock-data](https://github.com/shapefire/a-stock-data)）**：
+  - `a_stock.py` mootdx 客户端改用 `tdx_client()` 模式：内置 `_TDX_SERVERS` TCP 探测 +
+    三级 fallback，修复 mootdx 0.11.x 全新安装时 `BESTIP.HQ` 空串导致
+    `Quotes.factory()` 崩溃的问题。
+  - 新增 `get_industry_research_reports()`：东财行业研报（`reportapi` 同端点，`qType=1`），
+    支持 `industry_code="*"` 全行业或按东财行业码过滤；已接入 vendor 路由、LangChain 工具
+    及 fundamentals analyst。
+
 ## [2026-06-14]
 
 ### Added

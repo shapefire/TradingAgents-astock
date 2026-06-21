@@ -83,5 +83,5 @@ deepseek-v4-flash 等模型在 tool call 时可能返回中文股票名而非 6 
 - Web UI 改动在 `web/` 目录，用 `streamlit run web/launch.py` 本地测试
 
 ## 相关项目
-- [a-stock-data](https://github.com/simonlin1212/a-stock-data) — A 股 MCP 数据服务（Claude Code 用的 skill）
+- [a-stock-data](https://github.com/shapefire/a-stock-data) — A 股 MCP 数据服务（Claude Code 用的 skill）
 - 上游 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) — 原版框架

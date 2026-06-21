@@ -233,6 +233,28 @@ def get_research_reports(
 
 
 @tool
+def get_industry_research_reports(
+    industry_code: Annotated[str, 'Eastmoney industry code, "*" for all industries'] = "*",
+    max_pages: Annotated[int, "Max pages (default 2)"] = 2,
+    begin: Annotated[str, "Start date YYYY-MM-DD (default 2024-01-01)"] = "2024-01-01",
+) -> str:
+    """
+    Retrieve broker industry research reports (东财行业研报, qType=1).
+    industry_code="*" returns all industries; pass a specific code (e.g. "1238")
+    to filter. Use "*" first to discover industryName/industryCode from results.
+    Args:
+        industry_code (str): Eastmoney industry code or "*" for all
+        max_pages (int): Max pages to fetch
+        begin (str): Start date filter
+    Returns:
+        str: Industry research report list with rating distribution
+    """
+    return route_to_vendor(
+        "get_industry_research_reports", industry_code, max_pages, begin
+    )
+
+
+@tool
 def get_dividend_history(
     ticker: Annotated[str, "A-stock code (e.g. 688017)"],
     page_size: Annotated[int, "Number of records (default 10)"] = 10,

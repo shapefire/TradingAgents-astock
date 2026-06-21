@@ -10,6 +10,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_language_instruction,
     get_profit_forecast,
     get_research_reports,
+    get_industry_research_reports,
     get_dividend_history,
 )
 from tradingagents.dataflows.config import get_config
@@ -28,6 +29,7 @@ def create_fundamentals_analyst(llm):
             get_profit_forecast,
             get_industry_comparison,
             get_research_reports,
+            get_industry_research_reports,
             get_dividend_history,
         ]
 
@@ -46,7 +48,8 @@ def create_fundamentals_analyst(llm):
             "\n- `get_cashflow`：现金流量表详细数据"
             "\n- `get_income_statement`：利润表详细数据"
             "\n- `get_industry_comparison(ticker, curr_date)`：获取全行业横向对比（90个行业涨跌幅/成交额/净流入排名，用于估值对标和行业定位）"
-            "\n- `get_research_reports(ticker)`：获取券商研报列表（机构评级分布、目标价、EPS预测，识别评级趋势）"
+            "\n- `get_research_reports(ticker)`：获取券商个股研报列表（机构评级分布、目标价、EPS预测，识别评级趋势）"
+            "\n- `get_industry_research_reports(industry_code=\"*\")`：获取行业研报列表（qType=1；\"*\"=全行业，或传东财行业码如\"1238\"精确过滤）"
             "\n- `get_dividend_history(ticker)`：获取分红送转历史（股息率计算、高送转题材识别）"
             "\n\n撰写详尽的基本面研究报告，给出具体数据支撑的分析结论（仅供研究参考，不构成投资建议）。报告末尾附 Markdown 表格汇总关键财务指标和估值水平。"
             "\n\n📋 必采清单 — 以下数据点必须出现在报告中，无法获取时标注 [数据缺失: xxx]："

@@ -12,17 +12,24 @@ Data sources:
 - 新浪财经 (direct HTTP): K-line fallback, financial statements
 - 同花顺 (direct HTTP): consensus EPS, hot stocks, northbound capital flow
 
-V3.2.2 changes (aligned with a-stock-data SKILL.md):
+V3.2.4 changes (aligned with a-stock-data SKILL.md):
+- mootdx: tdx_client() with _TDX_SERVERS TCP probe + 3-level fallback (fixes 0.11.x BESTIP bug)
+
+V3.2.3 changes:
+- get_industry_research_reports: 东财行业研报 (qType=1, same reportapi endpoint)
+
+V3.2.2 changes:
 - Concept blocks: Baidu PAE getrelatedblock → 东财 slist API (spt=3)
 - Global news: CLS wire offline (cls.cn migrated to Next.js) → Eastmoney 7x24 only
 - Sina financial reports: Fixed report_list parsing structure
 - Fund flow: Extended from 20 to 120 trading days
 
-New endpoints (V3.2.2 additions):
+New endpoints (V3.2.2+ additions):
 - get_margin_trading: 融资融券明细 (leverage sentiment indicator)
 - get_block_trade: 大宗交易 (institutional intent, premium/discount signals)
 - get_shareholder_count: 股东户数变化 (chip concentration, accumulation detection)
-- get_research_reports: 研报列表 (institutional ratings, EPS forecasts)
+- get_research_reports: 个股研报列表 (institutional ratings, EPS forecasts)
+- get_industry_research_reports: 行业研报列表 (qType=1, industry_code filter)
 - get_dividend_history: 分红送转历史 (dividend yield, high bonus/transfer catalyst)
 - get_daily_dragon_tiger: 全市场龙虎榜 (daily full-market summary)
 - get_northbound_stock_holdings: 北向个股持仓 (foreign institutional holdings)
@@ -305,6 +312,51 @@ _mootdx_lock = threading.Lock()
 _MOOTDX_CONNECT_TIMEOUT = float(os.environ.get("MOOTDX_CONNECT_TIMEOUT", "5"))
 _MOOTDX_BARS_TIMEOUT = float(os.environ.get("MOOTDX_BARS_TIMEOUT", "8"))
 
+# Verified TDX servers (2026-06, aligned with a-stock-data v3.2.4)
+_TDX_SERVERS = [
+    ("119.97.185.59", 7709),
+    ("124.70.133.119", 7709),
+    ("116.205.183.150", 7709),
+    ("123.60.73.44", 7709),
+    ("116.205.163.254", 7709),
+    ("121.36.225.169", 7709),
+    ("123.60.70.228", 7709),
+    ("124.71.9.153", 7709),
+    ("110.41.147.114", 7709),
+    ("124.71.187.122", 7709),
+]
+
+
+def _probe_tdx_server(ip: str, port: int, timeout: float = 2.0) -> bool:
+    """TCP handshake probe — is TDX server reachable?"""
+    import socket
+
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _tdx_client(market: str = "std"):
+    """Create mootdx client, bypassing 0.11.x BESTIP.HQ empty-string bug (V3.2.4)."""
+    from mootdx.quotes import Quotes
+
+    for ip, port in _TDX_SERVERS:
+        if _probe_tdx_server(ip, port):
+            return Quotes.factory(market=market, server=(ip, port))
+    try:
+        return Quotes.factory(market=market, bestip=True)
+    except Exception:
+        pass
+    try:
+        return Quotes.factory(market=market)
+    except Exception as e:
+        raise RuntimeError(
+            "所有 mootdx 服务器均不可达。海外网络通常全部超时（TCP 7709），"
+            f"请走国内代理或更新 _TDX_SERVERS 列表。原始错误：{e}"
+        ) from e
+
 
 def _fetch_mootdx_bars(
     client: object,
@@ -341,15 +393,16 @@ def _create_mootdx_quotes() -> object | None:
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
     def _connect():
-        from mootdx.quotes import Quotes
-
-        return Quotes.factory(market="std")
+        return _tdx_client()
 
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(_connect).result(timeout=_MOOTDX_CONNECT_TIMEOUT)
     except FuturesTimeout:
         logger.warning("mootdx connection timed out after %.0fs", _MOOTDX_CONNECT_TIMEOUT)
+        return None
+    except RuntimeError as exc:
+        logger.warning("mootdx connection failed: %s", exc)
         return None
     except Exception as exc:
         logger.warning("mootdx connection failed: %s", exc)
@@ -3203,6 +3256,101 @@ def get_research_reports(
 
     except Exception as e:
         return f"Error fetching research reports for {code}: {str(e)}"
+
+
+def get_industry_research_reports(
+    industry_code: Annotated[str, 'Eastmoney industry code, "*" for all'] = "*",
+    max_pages: Annotated[int, "Max pages to fetch (default 2)"] = 2,
+    begin: Annotated[str, "Start date YYYY-MM-DD (default 2024-01-01)"] = "2024-01-01",
+) -> str:
+    """Get broker industry research reports (东财行业研报, qType=1).
+
+    industry_code="*" returns all industries; pass a specific code (e.g. "1238"
+    for IT服务Ⅱ) to filter. Industry names/codes appear in each record's
+    industryName / industryCode fields — use "*" first to discover codes.
+
+    Data source: Eastmoney reportapi (same endpoint as stock reports).
+    """
+    all_records = []
+
+    try:
+        for page in range(1, max_pages + 1):
+            params = {
+                "industryCode": industry_code,
+                "pageSize": "100",
+                "industry": "*",
+                "rating": "*",
+                "ratingChange": "*",
+                "beginTime": begin,
+                "endTime": "2030-01-01",
+                "pageNo": str(page),
+                "fields": "",
+                "qType": "1",
+            }
+            r = _em_get(
+                _REPORT_API,
+                params=params,
+                headers={"Referer": "https://data.eastmoney.com/"},
+                timeout=30,
+            )
+            if r is None:
+                break
+            d = r.json()
+            rows = d.get("data") or []
+            if not rows:
+                break
+            all_records.extend(rows)
+            if page >= (d.get("TotalPage", 1) or 1):
+                break
+
+        if not all_records:
+            label = "全行业" if industry_code == "*" else f"行业码 {industry_code}"
+            return f"No industry research reports found for {label}"
+
+        lines = [
+            f"# 行业研报列表 | {industry_code if industry_code != '*' else '全行业'}",
+            f"# Source: 东财 reportapi qType=1 (共 {len(all_records)} 篇)",
+            f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "日期 | 行业 | 机构 | 评级 | 标题",
+            "--- | --- | --- | --- | ---",
+        ]
+
+        rating_counts: dict[str, int] = {}
+        industries_seen: dict[str, str] = {}
+
+        for rec in all_records[:50]:
+            date_str = str(rec.get("publishDate", ""))[:10]
+            industry = rec.get("industryName", "")
+            ind_code = str(rec.get("industryCode", ""))
+            org = rec.get("orgSName", "")
+            rating = rec.get("emRatingName", "")
+            title = (rec.get("title", "") or "")[:50]
+
+            if industry and ind_code:
+                industries_seen[ind_code] = industry
+            rating_counts[rating] = rating_counts.get(rating, 0) + 1
+
+            lines.append(
+                f"  {date_str} | {industry} | {org} | {rating} | {title}"
+            )
+
+        lines.append("")
+        lines.append("## 评级分布")
+        for rating, count in sorted(rating_counts.items(), key=lambda x: -x[1]):
+            if rating:
+                lines.append(f"  {rating}: {count} 篇")
+
+        if industries_seen and industry_code == "*":
+            lines.append("")
+            lines.append("## 涉及行业（前20，含行业码）")
+            for code, name in list(industries_seen.items())[:20]:
+                lines.append(f"  {name} ({code})")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching industry research reports: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
