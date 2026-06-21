@@ -189,6 +189,11 @@ def _build_config() -> dict:
     config["max_debate_rounds"] = 1
     config["max_risk_discuss_rounds"] = 1
     config["output_language"] = "Chinese"
+    config["short_term_mode"] = bool(st.session_state.get("short_term_mode", False))
+    config["short_term_analyst_subset"] = DEFAULT_CONFIG.get("short_term_analyst_subset", [])
+    config["short_term_skip_quality_gate_llm"] = DEFAULT_CONFIG.get(
+        "short_term_skip_quality_gate_llm", True,
+    )
     return config
 
 
@@ -206,11 +211,14 @@ if start_req:
         ticker=start_req["ticker"],
         trade_date=start_req["trade_date"],
     )
+    config = _build_config()
+    if config.get("short_term_mode") and config.get("short_term_analyst_subset"):
+        tracker.analyst_stage_ids = list(config["short_term_analyst_subset"])
     st.session_state["tracker"] = tracker
     run_analysis_in_thread(
         ticker=start_req["ticker"],
         trade_date=start_req["trade_date"],
-        config=_build_config(),
+        config=config,
         tracker=tracker,
     )
 

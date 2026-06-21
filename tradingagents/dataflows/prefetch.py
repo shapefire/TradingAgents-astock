@@ -52,7 +52,7 @@ _PREFETCH_TASKS: list[tuple[str, tuple, dict[str, str]]] = [
     ("get_theme_heat", (), {"trade_date": "{date}"}),
     ("get_first_board_screen", (), {"trade_date": "{date}"}),
     ("get_high_board_status", (), {"trade_date": "{date}"}),
-    ("get_leader_identification", (), {"trade_date": "{date}", "theme": ""}),
+    ("get_leader_identification", (), {"ticker": "{ticker}", "trade_date": "{date}", "theme": ""}),
 ]
 
 

@@ -327,6 +327,7 @@ def get_consecutive_limit_stats(
 @tool
 def get_theme_heat(
     trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
+    top_n: Annotated[int, "Number of top themes to return, default 10"] = 10,
 ) -> str:
     """
     Retrieve theme/sector heat tracking with trend and phase analysis.
@@ -335,15 +336,17 @@ def get_theme_heat(
     Critical for identifying which themes are gaining momentum.
     Args:
         trade_date (str): Date in YYYY-MM-DD format
+        top_n (int): Number of top themes to return (default 10)
     Returns:
         str: Theme heat ranking with trend, phase, and leader analysis
     """
-    return route_to_vendor("get_theme_heat", trade_date)
+    return route_to_vendor("get_theme_heat", trade_date, top_n)
 
 
 @tool
 def get_first_board_screen(
     trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
+    min_score: Annotated[int, "Minimum second-board expectation score, default 60"] = 60,
 ) -> str:
     """
     Retrieve first-board (首板) stock screening with second-board probability scoring.
@@ -352,10 +355,11 @@ def get_first_board_screen(
     Useful for identifying high-probability breakout candidates.
     Args:
         trade_date (str): Date in YYYY-MM-DD format
+        min_score (int): Minimum second-board expectation score (default 60)
     Returns:
         str: First-board screening report with second-board expectation scores
     """
-    return route_to_vendor("get_first_board_screen", trade_date)
+    return route_to_vendor("get_first_board_screen", trade_date, min_score)
 
 
 @tool
@@ -377,8 +381,9 @@ def get_high_board_status(
 
 @tool
 def get_leader_identification(
-    trade_date: Annotated[str, "Date in YYYY-MM-DD format"],
-    theme: Annotated[str, "Theme name to analyze (empty for all themes)"] = "",
+    ticker: Annotated[str, "A-stock code (e.g. 000001), empty to use theme-only mode"] = "",
+    trade_date: Annotated[str, "Date in YYYY-MM-DD format"] = "",
+    theme: Annotated[str, "Theme name to analyze when ticker is empty"] = "",
 ) -> str:
     """
     Retrieve leader (龙头) identification and card-position (卡位) analysis.
@@ -386,9 +391,10 @@ def get_leader_identification(
     deputy leader (补涨龙) identification, and new leader vs deputy distinction.
     Essential for understanding intra-theme hierarchy and rotation.
     Args:
+        ticker (str): Target stock code; pass company_of_interest for per-stock analysis
         trade_date (str): Date in YYYY-MM-DD format
-        theme (str): Specific theme to analyze, empty string for all themes
+        theme (str): Specific theme to analyze when ticker is empty
     Returns:
         str: Leader identification report with scoring and position analysis
     """
-    return route_to_vendor("get_leader_identification", trade_date, theme)
+    return route_to_vendor("get_leader_identification", ticker, trade_date, theme)

@@ -82,6 +82,61 @@ def _datacenter_query(report_name, columns="ALL", filter_str="", page_size=50,
 # 验证函数
 # ---------------------------------------------------------------------------
 
+_EM_PUSH2EX_UT = "7eea3edcaed734bea9cbfc24409ed989"
+_EM_PUSH2EX_BASE = "https://push2ex.eastmoney.com"
+
+
+def _push2ex_pool(endpoint: str, trade_date: str, sort: str) -> dict:
+    """调用 push2ex 股池并返回摘要。"""
+    date_fmt = trade_date.replace("-", "")
+    url = f"{_EM_PUSH2EX_BASE}/{endpoint}"
+    params = {
+        "ut": _EM_PUSH2EX_UT,
+        "dpt": "wz.ztzt",
+        "Pageindex": "0",
+        "pagesize": "10000",
+        "sort": sort,
+        "date": date_fmt,
+    }
+    headers = {"Referer": "https://quote.eastmoney.com/ztb/detail"}
+    r = _em_get(url, params=params, headers=headers, timeout=15)
+    data = r.json()
+    pool = (data.get("data") or {}).get("pool") or []
+    max_lbc = max((int(x.get("lbc") or 0) for x in pool), default=0)
+    sample = pool[0] if pool else None
+    return {
+        "endpoint": endpoint,
+        "sort": sort,
+        "available": bool(pool),
+        "count": len(pool),
+        "max_lbc": max_lbc,
+        "sample_keys": list(sample.keys()) if sample else None,
+        "sample": sample,
+    }
+
+
+def verify_push2ex_pools(trade_date: str) -> dict:
+    """验证东财 push2ex 涨停/跌停/炸板股池接口。"""
+    pools = [
+        ("getTopicZTPool", "fbt:asc", "涨停股池"),
+        ("getTopicDTPool", "fund:asc", "跌停股池"),
+        ("getTopicZBPool", "fbt:asc", "炸板股池"),
+        ("getYesterdayZTPool", "zs:desc", "昨日涨停股池"),
+    ]
+    result = {"trade_date": trade_date, "pools": {}}
+    for endpoint, sort, label in pools:
+        info = _push2ex_pool(endpoint, trade_date, sort)
+        result["pools"][endpoint] = info
+        if info["available"]:
+            extra = f", max_lbc={info['max_lbc']}" if endpoint == "getTopicZTPool" else ""
+            print(f"   ✅ {label} ({endpoint}): {info['count']} 条{extra}")
+            if info.get("sample_keys"):
+                print(f"      字段: {info['sample_keys']}")
+        else:
+            print(f"   ❌ {label} ({endpoint}): 无数据（非交易日或超出 ~2 周窗口）")
+    return result
+
+
 def verify_limitup_stock(trade_date: str):
     """验证涨停数据接口（多源验证）"""
     print(f"\n{'='*60}")
@@ -94,6 +149,7 @@ def verify_limitup_stock(trade_date: str):
         "eastmoney_datacenter": None,
         "eastmoney_xuangu": None,
         "ths_getharden": None,
+        "push2ex": None,
         "mootdx_kline": None,
     }
 
@@ -178,8 +234,12 @@ def verify_limitup_stock(trade_date: str):
         print(f"   ❌ 请求失败: {e}")
         results["ths_getharden"] = {"available": False, "error": str(e)}
 
-    # 4. 尝试 mootdx K 线数据判断涨停和连板天数
-    print("\n[4] 尝试 mootdx K 线数据判断涨停和连板天数...")
+    # 5. 东财 push2ex 涨停/炸板/跌停股池
+    print("\n[5] 尝试东财 push2ex 涨停股池 (getTopicZTPool)...")
+    results["push2ex"] = verify_push2ex_pools(trade_date)
+
+    # 6. 尝试 mootdx K 线数据判断涨停和连板天数
+    print("\n[6] 尝试 mootdx K 线数据判断涨停和连板天数...")
     try:
         from mootdx.quotes import Quotes
         client = Quotes.factory(market='std')
@@ -605,6 +665,14 @@ def main():
             print(f"  ✅ mootdx K线: 可用（可判断涨停）")
         else:
             print(f"  ❌ mootdx K线: 不可用")
+
+        # push2ex
+        push2ex = r.get("push2ex", {}).get("pools", {})
+        zt = push2ex.get("getTopicZTPool", {})
+        if zt.get("available"):
+            print(f"  ✅ 东财 push2ex 涨停池: {zt.get('count')} 条, max_lbc={zt.get('max_lbc')}")
+        else:
+            print(f"  ❌ 东财 push2ex 涨停池: 无数据")
     else:
         print(f"  ❌ 无法验证")
 
@@ -647,8 +715,8 @@ def main():
     print(f"\n{'='*60}")
     print(f"🔑 关键结论")
     print(f"{'='*60}")
-    print(f"1. 东财 RPT_LIMITUP_STOCK 接口已失效，需使用替代方案")
-    print(f"2. 推荐方案: 同花顺 getharden（涨停原因）+ mootdx K线（连板天数）")
+    print(f"1. 东财 RPT_LIMITUP_STOCK 接口已失效，主方案改用 push2ex getTopicZTPool")
+    print(f"2. 推荐方案: 东财 push2ex（连板数 lbc）+ 同花顺 getharden（涨停原因）+ K线 fallback")
     print(f"3. 东财选股接口可作为补充数据源")
     print(f"4. 封单数据需通过 push2 实时行情获取")
 

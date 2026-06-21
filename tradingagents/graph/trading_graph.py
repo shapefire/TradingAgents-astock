@@ -28,6 +28,11 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.interface import clear_vendor_cache
 from tradingagents.dataflows.a_stock import clear_session_cache
 from tradingagents.dataflows.prefetch import prefetch_vendor_data
+from tradingagents.logic.trading_hard_logic import (
+    evaluate as evaluate_hard_signal,
+    hard_signal_to_json,
+    hard_signal_to_markdown,
+)
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -61,6 +66,31 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+
+ALL_ANALYST_KEYS = [
+    "market",
+    "social",
+    "news",
+    "fundamentals",
+    "policy",
+    "hot_money",
+    "lockup",
+    "short_term",
+]
+
+
+def resolve_analyst_selection(
+    selected_analysts: list[str],
+    config: dict[str, Any],
+) -> list[str]:
+    """Apply short-term analyst subset when short_term_mode is enabled."""
+    if not config.get("short_term_mode"):
+        return list(selected_analysts)
+    subset = config.get("short_term_analyst_subset") or []
+    if not subset:
+        return list(selected_analysts)
+    valid = [key for key in subset if key in ALL_ANALYST_KEYS]
+    return valid or list(selected_analysts)
 
 
 class TradingAgentsGraph:
@@ -121,15 +151,29 @@ class TradingAgentsGraph:
         self.tool_nodes = self._create_tool_nodes()
 
         # Initialize components
+        short_term_mode = bool(self.config.get("short_term_mode", False))
+        selected_analysts = resolve_analyst_selection(selected_analysts, self.config)
+        self.selected_analysts = selected_analysts
+        max_debate_rounds = (
+            self.config.get("short_term_max_debate_rounds", 2)
+            if short_term_mode
+            else self.config["max_debate_rounds"]
+        )
+        skip_quality_gate_llm = (
+            short_term_mode
+            and bool(self.config.get("short_term_skip_quality_gate_llm", False))
+        )
         self.conditional_logic = ConditionalLogic(
-            max_debate_rounds=self.config["max_debate_rounds"],
+            max_debate_rounds=max_debate_rounds,
             max_risk_discuss_rounds=self.config["max_risk_discuss_rounds"],
+            short_term_mode=short_term_mode,
         )
         self.graph_setup = GraphSetup(
             self.quick_thinking_llm,
             self.deep_thinking_llm,
             self.tool_nodes,
             self.conditional_logic,
+            skip_quality_gate_llm=skip_quality_gate_llm,
         )
 
         self.propagator = Propagator()
@@ -374,11 +418,23 @@ class TradingAgentsGraph:
         # route_to_vendor() reads from.
         prefetch_vendor_data(company_name, str(trade_date))
 
+        # Compute deterministic hard logic signal for target ticker.
+        try:
+            hard = evaluate_hard_signal(company_name, str(trade_date))
+            hard_json = hard_signal_to_json(hard)
+            hard_summary = hard_signal_to_markdown(hard)
+        except Exception as exc:
+            logger.warning("Hard signal evaluation failed: %s", exc)
+            hard_json = ""
+            hard_summary = ""
+
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
         init_agent_state = self.propagator.create_initial_state(
             company_name, trade_date, past_context=past_context
         )
+        init_agent_state["hard_signal"] = hard_json
+        init_agent_state["hard_signal_summary"] = hard_summary
         args = self.propagator.get_graph_args()
 
         # Inject thread_id so same ticker+date resumes, different date starts fresh.
@@ -432,6 +488,8 @@ class TradingAgentsGraph:
             "hot_money_report": final_state.get("hot_money_report", ""),
             "lockup_report": final_state.get("lockup_report", ""),
             "short_term_report": final_state.get("short_term_report", ""),
+            "hard_signal": final_state.get("hard_signal", ""),
+            "hard_signal_summary": final_state.get("hard_signal_summary", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],

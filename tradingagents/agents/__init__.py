@@ -23,6 +23,7 @@ from .managers.research_manager import create_research_manager
 from .managers.portfolio_manager import create_portfolio_manager
 
 from .trader.trader import create_trader
+from .trader.short_term_trader import create_short_term_trader
 
 __all__ = [
     "AgentState",
@@ -45,5 +46,6 @@ __all__ = [
     "create_conservative_debator",
     "create_social_media_analyst",
     "create_short_term_analyst",
+    "create_short_term_trader",
     "create_trader",
 ]

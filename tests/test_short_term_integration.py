@@ -235,11 +235,18 @@ class TestSignalDataToolsSignatures:
         fields = get_theme_heat.args_schema.model_fields
         assert "trade_date" in fields
 
-    def test_first_board_screen_has_trade_date(self):
-        """get_first_board_screen 应接受 trade_date 参数"""
+    def test_theme_heat_has_top_n_param(self):
+        """get_theme_heat 应接受 top_n 参数"""
+        from tradingagents.agents.utils.signal_data_tools import get_theme_heat
+        fields = get_theme_heat.args_schema.model_fields
+        assert "top_n" in fields
+
+    def test_first_board_screen_has_min_score_param(self):
+        """get_first_board_screen 应接受 trade_date 与 min_score 参数"""
         from tradingagents.agents.utils.signal_data_tools import get_first_board_screen
         fields = get_first_board_screen.args_schema.model_fields
         assert "trade_date" in fields
+        assert "min_score" in fields
 
     def test_high_board_status_has_trade_date(self):
         """get_high_board_status 应接受 trade_date 参数"""
@@ -248,9 +255,10 @@ class TestSignalDataToolsSignatures:
         assert "trade_date" in fields
 
     def test_leader_identification_has_both_params(self):
-        """get_leader_identification 应接受 trade_date 和 theme 参数"""
+        """get_leader_identification 应接受 ticker, trade_date 和 theme 参数"""
         from tradingagents.agents.utils.signal_data_tools import get_leader_identification
         fields = get_leader_identification.args_schema.model_fields
+        assert "ticker" in fields
         assert "trade_date" in fields
         assert "theme" in fields
 

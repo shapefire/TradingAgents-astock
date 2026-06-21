@@ -51,6 +51,10 @@ class ProgressTracker:
     tokens_in: int = 0
     tokens_out: int = 0
 
+    hard_signal_summary: str = ""
+
+    analyst_stage_ids: list[str] | None = None
+
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def mark_stage_active(self, stage_id: str) -> None:

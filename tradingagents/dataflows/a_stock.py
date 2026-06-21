@@ -31,7 +31,7 @@ New endpoints (V3.2.2 additions):
 from __future__ import annotations
 
 from typing import Annotated
-from datetime import datetime
+from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import json as _json
 import os
@@ -39,9 +39,11 @@ import logging
 import math
 import random
 import re as _re
+import threading
 import time
 import uuid
-import urllib.request
+import urllib.parse
+from io import StringIO
 
 import pandas as pd
 import requests as _requests
@@ -131,7 +133,6 @@ def resolve_ticker_online(name: str) -> str:
     This is a lightweight alternative to building full market map.
     Works even when push2 API is blocked by proxy.
     """
-    import urllib.parse
     try:
         encoded_name = urllib.parse.quote(name)
         url = (
@@ -139,10 +140,8 @@ def resolve_ticker_online(name: str) -> str:
             f"input={encoded_name}&type=14"
             f"&token=D43BF722C8E33BDC906FB84D85E326E8&count=5"
         )
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", _UA)
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = _json.loads(resp.read().decode("utf-8"))
+        resp = _direct_get(url, timeout=10)
+        data = _json.loads(resp.content.decode("utf-8"))
 
         items = data.get("QuotationCodeTable", {}).get("Data", [])
         if not items:
@@ -166,12 +165,8 @@ def _build_name_code_map_mootdx() -> tuple[dict[str, str], dict[str, str]]:
 
     Returns empty dicts if mootdx is unreachable (e.g. TCP 7709 down).
     """
-    try:
-        from mootdx.quotes import Quotes
-
-        client = Quotes.factory(market="std")
-    except Exception as exc:
-        logger.warning("mootdx connection failed: %s", exc)
+    client = _create_mootdx_quotes()
+    if client is None:
         return {}, {}
 
     n2c: dict[str, str] = {}
@@ -224,6 +219,9 @@ def _build_name_code_map_http() -> tuple[dict[str, str], dict[str, str]]:
             "fields": "f12,f14",
         }
         r = _em_get(url, params=params, timeout=30)
+        if r is None:
+            logger.warning("Eastmoney HTTP API skipped (cooldown) for name-code map")
+            return {}, {}
         data = r.json()
 
         items = data.get("data", {}).get("diff", [])
@@ -302,15 +300,86 @@ def resolve_ticker(user_input: str) -> str:
 # ---------------------------------------------------------------------------
 
 _mootdx_client = None
+_mootdx_unavailable = False
+_mootdx_lock = threading.Lock()
+_MOOTDX_CONNECT_TIMEOUT = float(os.environ.get("MOOTDX_CONNECT_TIMEOUT", "5"))
+_MOOTDX_BARS_TIMEOUT = float(os.environ.get("MOOTDX_BARS_TIMEOUT", "8"))
+
+
+def _fetch_mootdx_bars(
+    client: object,
+    code: str,
+    *,
+    category: int = 4,
+    offset: int = 800,
+    timeout: float | None = None,
+):
+    """Fetch mootdx bars with timeout (avoid indefinite TCP hang on bars())."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+    if timeout is None:
+        timeout = _MOOTDX_BARS_TIMEOUT
+
+    def _call():
+        return client.bars(symbol=code, category=category, offset=offset)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_call).result(timeout=timeout)
+    except FuturesTimeout:
+        logger.warning(
+            "mootdx bars timed out after %.0fs for %s", timeout, code
+        )
+        return None
+    except Exception as exc:
+        logger.warning("mootdx bars failed for %s: %s", code, exc)
+        return None
+
+
+def _create_mootdx_quotes() -> object | None:
+    """Create mootdx client with connect timeout (avoid indefinite TCP hang)."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+    def _connect():
+        from mootdx.quotes import Quotes
+
+        return Quotes.factory(market="std")
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_connect).result(timeout=_MOOTDX_CONNECT_TIMEOUT)
+    except FuturesTimeout:
+        logger.warning("mootdx connection timed out after %.0fs", _MOOTDX_CONNECT_TIMEOUT)
+        return None
+    except Exception as exc:
+        logger.warning("mootdx connection failed: %s", exc)
+        return None
+
+
+_ohlcv_session_cache: dict[str, pd.DataFrame] = {}
+_ohlcv_fetch_lock = threading.Lock()
 
 
 def _get_mootdx_client():
-    """Lazy-init mootdx Quotes client (TCP connection, reusable)."""
-    global _mootdx_client
-    if _mootdx_client is None:
-        from mootdx.quotes import Quotes
+    """Lazy-init mootdx Quotes client (TCP connection, reusable).
 
-        _mootdx_client = Quotes.factory(market="std")
+    Returns None when mootdx TCP (port 7709) is unreachable; callers should
+    fall back to HTTP sources (sina / tencent / eastmoney).
+    """
+    global _mootdx_client, _mootdx_unavailable
+    if _mootdx_unavailable:
+        return None
+    if _mootdx_client is not None:
+        return _mootdx_client
+    with _mootdx_lock:
+        if _mootdx_unavailable:
+            return None
+        if _mootdx_client is None:
+            client = _create_mootdx_quotes()
+            if client is None:
+                _mootdx_unavailable = True
+                return None
+            _mootdx_client = client
     return _mootdx_client
 
 
@@ -330,10 +399,8 @@ def _tencent_quote(codes: list[str]) -> dict[str, dict]:
     try:
         prefixed = [f"{_get_prefix(c)}{c}" for c in codes]
         url = "https://qt.gtimg.cn/q=" + ",".join(prefixed)
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        resp = urllib.request.urlopen(req, timeout=10)
-        raw = resp.read().decode("gbk")
+        resp = _direct_get(url, timeout=10)
+        raw = resp.content.decode("gbk")
 
         result = {}
         for line in raw.strip().split(";"):
@@ -386,8 +453,18 @@ _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 # 请求一律走 _em_get()：串行限流（最小间隔 + 随机抖动）+ 复用 Keep-Alive 会话 + 默认 UA。
 # 注意：仅东财接口走此入口；mootdx(TCP) / 腾讯 / 新浪 / 同花顺 / 财联社 / 百度 等
 # 不限流（实测不封 IP 或风控极弱）。批量任务可调大 EM_MIN_INTERVAL 进一步降速。
+#
+# 国内数据源不走系统代理：Windows 注册表/Clash 常留 127.0.0.1 代理，代理未启动时
+# requests 默认 trust_env=True 会导致 ProxyError 并拖慢整条分析链路。
 _EM_SESSION = _requests.Session()
+_EM_SESSION.trust_env = False
 _EM_SESSION.headers.update({"User-Agent": _UA})
+_DIRECT_SESSION = _requests.Session()
+_DIRECT_SESSION.trust_env = False
+_DIRECT_SESSION.headers.update({"User-Agent": _UA})
+_em_lock = threading.Lock()
+# push2/push2his 在部分网络 HTTPS 被 RST，HTTP 可用
+_EM_HTTP_FALLBACK_HOSTS = ("push2.eastmoney.com", "push2his.eastmoney.com")
 # 两次东财请求最小间隔(秒)；批量多 Agent 场景可设环境变量 EM_MIN_INTERVAL=1.5~2 降速。
 _EM_MIN_INTERVAL = float(os.environ.get("EM_MIN_INTERVAL", "1.0"))
 _em_last_call = [0.0]  # 模块级上次东财请求时间戳
@@ -395,6 +472,16 @@ _em_last_call = [0.0]  # 模块级上次东财请求时间戳
 _em_consecutive_fails = [0]
 _EM_FAIL_FAST_THRESHOLD = 3  # 连续失败 3 次后跳过
 _EM_COOLDOWN_SECONDS = 30    # 跳过冷却时间（秒）
+
+
+def _direct_get(*args, **kwargs):
+    """HTTP GET bypassing system proxy (for domestic APIs)."""
+    return _DIRECT_SESSION.get(*args, **kwargs)
+
+
+def _direct_post(*args, **kwargs):
+    """HTTP POST bypassing system proxy (for domestic APIs)."""
+    return _DIRECT_SESSION.post(*args, **kwargs)
 
 
 def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
@@ -408,29 +495,52 @@ def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
     而非每次都等待 timeout 秒，避免分析流程被卡住。冷却 _EM_COOLDOWN_SECONDS
     秒后自动恢复。
     """
-    # 快速失败检查
-    if _em_consecutive_fails[0] >= _EM_FAIL_FAST_THRESHOLD:
-        elapsed = time.time() - _em_last_call[0]
-        if elapsed < _EM_COOLDOWN_SECONDS:
-            logger.debug("_em_get: skipping (cooldown %ds left)", int(_EM_COOLDOWN_SECONDS - elapsed))
-            return None
-        # 冷却期结束，重置计数器，允许重试
-        _em_consecutive_fails[0] = 0
+    urls_to_try = [url]
+    if url.startswith("https://") and any(h in url for h in _EM_HTTP_FALLBACK_HOSTS):
+        urls_to_try.append("http://" + url[8:])
 
-    wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
-    if wait > 0:
-        time.sleep(wait + random.uniform(0.1, 0.5))
-    try:
-        resp = _EM_SESSION.get(
-            url, params=params, headers=headers, timeout=timeout, **kwargs
-        )
-        _em_consecutive_fails[0] = 0  # 成功，重置计数器
-        return resp
-    except Exception:
-        _em_consecutive_fails[0] += 1
-        raise
-    finally:
-        _em_last_call[0] = time.time()
+    with _em_lock:
+        # 快速失败检查
+        if _em_consecutive_fails[0] >= _EM_FAIL_FAST_THRESHOLD:
+            elapsed = time.time() - _em_last_call[0]
+            if elapsed < _EM_COOLDOWN_SECONDS:
+                logger.debug(
+                    "_em_get: skipping (cooldown %ds left)",
+                    int(_EM_COOLDOWN_SECONDS - elapsed),
+                )
+                return None
+            _em_consecutive_fails[0] = 0
+
+        wait = _EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+        if wait > 0:
+            time.sleep(wait + random.uniform(0.1, 0.5))
+
+        last_exc = None
+        try:
+            for attempt_url in urls_to_try:
+                try:
+                    resp = _EM_SESSION.get(
+                        attempt_url,
+                        params=params,
+                        headers=headers,
+                        timeout=timeout,
+                        **kwargs,
+                    )
+                    _em_consecutive_fails[0] = 0
+                    return resp
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt_url != urls_to_try[-1]:
+                        logger.debug(
+                            "_em_get: retry %s via HTTP after %s",
+                            attempt_url,
+                            type(exc).__name__,
+                        )
+                        continue
+                    _em_consecutive_fails[0] += 1
+                    raise last_exc from None
+        finally:
+            _em_last_call[0] = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +580,8 @@ def _eastmoney_datacenter(
         "client": "WEB",
     }
     r = _em_get(_DATACENTER_URL, params=params, timeout=15)
+    if r is None:
+        return []
     d = r.json()
     if d.get("result") and d["result"].get("data"):
         return d["result"]["data"]
@@ -491,9 +603,9 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
         "User-Agent": _UA,
         "Referer": "https://basic.10jqka.com.cn/",
     }
-    r = _requests.get(url, headers=headers, timeout=15)
+    r = _direct_get(url, headers=headers, timeout=15)
     r.encoding = "gbk"
-    dfs = pd.read_html(r.text)
+    dfs = pd.read_html(StringIO(r.text))
     # Find the table containing EPS data
     for df in dfs:
         cols = [str(c) for c in df.columns]
@@ -524,7 +636,7 @@ def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None
         "ma": "no",
         "datalen": "800",
     }
-    r = _requests.get(url, params=params, timeout=15)
+    r = _direct_get(url, params=params, timeout=15)
     r.raise_for_status()
     data = _json.loads(r.text)
 
@@ -566,6 +678,12 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
     from .config import get_config
 
     code = _normalize_ticker(symbol)
+    cutoff = pd.to_datetime(curr_date)
+
+    cached = _ohlcv_session_cache.get(code)
+    if cached is not None:
+        return cached[cached["Date"] <= cutoff]
+
     config = get_config()
     cache_dir = config.get(
         "data_cache_dir", os.path.expanduser("~/.tradingagents/cache")
@@ -573,65 +691,72 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
     os.makedirs(cache_dir, exist_ok=True)
 
     cache_file = os.path.join(cache_dir, f"{code}-astock-daily.csv")
-    cutoff = pd.to_datetime(curr_date)
 
     if os.path.exists(cache_file):
-        mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
-        if mtime.date() == datetime.now().date():
-            data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
-            data["Date"] = pd.to_datetime(data["Date"])
-            filtered = data[data["Date"] <= cutoff]
-            # 当日缓存可能在盘中生成，缺少 curr_date 的 K 线，导致连板少算 1 天
-            if (
-                not filtered.empty
-                and filtered["Date"].max().normalize() >= cutoff.normalize()
-            ):
-                return filtered
-            logger.debug(
-                "OHLCV cache stale for %s (need %s, have %s), refetching",
-                code,
-                curr_date,
-                filtered["Date"].max().strftime("%Y-%m-%d") if not filtered.empty else "none",
-            )
+        data = pd.read_csv(cache_file, on_bad_lines="skip", encoding="utf-8")
+        data["Date"] = pd.to_datetime(data["Date"])
+        filtered = data[data["Date"] <= cutoff]
+        # 磁盘缓存只要覆盖 curr_date 即可复用（跨日扫描不必逐股重拉）
+        if (
+            not filtered.empty
+            and filtered["Date"].max().normalize() >= cutoff.normalize()
+        ):
+            _ohlcv_session_cache[code] = data
+            return filtered
+        logger.debug(
+            "OHLCV cache stale for %s (need %s, have %s), refetching",
+            code,
+            curr_date,
+            filtered["Date"].max().strftime("%Y-%m-%d") if not filtered.empty else "none",
+        )
 
-    # Fetch from mootdx — 800 daily bars (~3 years of trading days)
-    try:
-        client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
+    with _ohlcv_fetch_lock:
+        cached = _ohlcv_session_cache.get(code)
+        if cached is not None:
+            return cached[cached["Date"] <= cutoff]
+
+        df = None
+        # mootdx 已判不可用时直接走新浪，避免逐股重复尝试 TCP
+        if not _mootdx_unavailable:
+            try:
+                client = _get_mootdx_client()
+                if client is None:
+                    raise ValueError("mootdx unavailable")
+                raw = _fetch_mootdx_bars(client, code, category=4, offset=800)
+
+                if raw is None or raw.empty:
+                    raise ValueError(f"No OHLCV data from mootdx for {code}")
+
+                # mootdx returns index named 'datetime' AND a column named 'datetime'
+                # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
+                df = raw.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
+                df = df.reset_index()  # moves index 'datetime' → column 'datetime'
+                rename_map = {
+                    "datetime": "Date",
+                    "open": "Open",
+                    "close": "Close",
+                    "high": "High",
+                    "low": "Low",
+                    "volume": "Volume",
+                }
+                df = df.rename(columns=rename_map)
+                df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+                df["Date"] = pd.to_datetime(df["Date"])
+            except Exception as e:
+                logger.debug("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
 
         if df is None or df.empty:
-            raise ValueError(f"No OHLCV data from mootdx for {code}")
+            try:
+                df = _sina_kline_fallback(code)
+                if df.empty:
+                    raise ValueError(f"No OHLCV data from sina for {code}")
+            except Exception:
+                raise ValueError(f"No OHLCV data from mootdx/sina for {code}")
 
-        # mootdx returns index named 'datetime' AND a column named 'datetime'
-        # (plus year/month/day/hour/minute/volume). Drop duplicates before reset.
-        df = df.drop(columns=["datetime", "year", "month", "day", "hour", "minute"], errors="ignore")
-        df = df.reset_index()  # moves index 'datetime' → column 'datetime'
-        rename_map = {
-            "datetime": "Date",
-            "open": "Open",
-            "close": "Close",
-            "high": "High",
-            "low": "Low",
-            "volume": "Volume",
-        }
-        df = df.rename(columns=rename_map)
-        df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-        df["Date"] = pd.to_datetime(df["Date"])
-    except Exception as e:
-        logger.warning("mootdx OHLCV failed for %s: %s, trying sina HTTP fallback", code, e)
-        # Fallback: Sina direct HTTP API
-        try:
-            df = _sina_kline_fallback(code)
-            if df.empty:
-                raise ValueError(f"No OHLCV data from sina for {code}")
-        except Exception:
-            raise ValueError(f"No OHLCV data from mootdx/sina for {code}")
+        # Cache to disk and session
+        df.to_csv(cache_file, index=False, encoding="utf-8")
+        _ohlcv_session_cache[code] = df
 
-    # Cache to disk
-    df.to_csv(cache_file, index=False, encoding="utf-8")
-
-    # Filter by curr_date to prevent look-ahead bias
-    cutoff = pd.to_datetime(curr_date)
     return df[df["Date"] <= cutoff]
 
 
@@ -654,7 +779,9 @@ def get_stock_data(
     data_source = "mootdx (TCP)"
     try:
         client = _get_mootdx_client()
-        df = client.bars(symbol=code, category=4, offset=800)
+        if client is None:
+            raise ValueError("mootdx unavailable")
+        df = _fetch_mootdx_bars(client, code, category=4, offset=800)
 
         if df is None or df.empty:
             raise ValueError(f"No data from mootdx for {code}")
@@ -837,6 +964,8 @@ def get_fundamentals(
         # --- mootdx: financial snapshot (quarterly) ---
         try:
             client = _get_mootdx_client()
+            if client is None:
+                raise ValueError("mootdx unavailable")
             fin = client.finance(symbol=code)
             if fin is not None and not (
                 isinstance(fin, pd.DataFrame) and fin.empty
@@ -871,6 +1000,8 @@ def get_fundamentals(
                 "secid": f"{market_code}.{code}",
             }
             r = _em_get(_info_url, params=_info_params, timeout=10)
+            if r is None:
+                raise ValueError("eastmoney push2 skipped (cooldown)")
             d = r.json().get("data", {})
             if d:
                 if d.get("f127"):
@@ -1010,7 +1141,7 @@ def _get_financial_report_sina(
         "page": "1",
         "num": "20",
     }
-    r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
+    r = _direct_get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
     d = r.json()
 
     # V3.2.2: Sina structure is result.data.report_list (dict keyed by period)
@@ -1182,6 +1313,8 @@ def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
     }
 
     resp = _em_get(url, params=params, headers=headers, timeout=15)
+    if resp is None:
+        return []
     resp.raise_for_status()
     text = resp.text
     text = text[text.index("(") + 1 : text.rindex(")")]
@@ -1214,7 +1347,7 @@ def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
         "Referer": "https://finance.sina.com.cn/",
     }
 
-    resp = _requests.get(url, headers=headers, timeout=15)
+    resp = _direct_get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     resp.encoding = "gb2312"
     html = resp.text
@@ -1396,6 +1529,8 @@ def get_insider_transactions(
 
     try:
         client = _get_mootdx_client()
+        if client is None:
+            return f"No insider/shareholder data for A-stock '{code}' (mootdx unavailable)"
         text = client.F10(symbol=code, name="股东研究")
 
         if not text or not text.strip():
@@ -1550,7 +1685,7 @@ def get_hot_stocks(
                 "Chrome/117.0.0.0 Safari/537.36"
             )
         }
-        r = requests.get(url, headers=headers, timeout=10)
+        r = _direct_get(url, headers=headers, timeout=10)
         data = r.json()
 
         if data.get("errocode", 0) != 0:
@@ -1697,7 +1832,7 @@ def get_northbound_flow(
 
     try:
         url_rt = "https://data.hexin.cn/market/hsgtApi/method/dayChart/"
-        r = requests.get(url_rt, headers=hsgt_headers, timeout=10)
+        r = _direct_get(url_rt, headers=hsgt_headers, timeout=10)
         d = r.json()
 
         times = d.get("time", [])
@@ -1805,6 +1940,8 @@ def get_concept_blocks(
             "Referer": "https://quote.eastmoney.com/",
         }
         r = _em_get(url, params=params, headers=headers, timeout=15)
+        if r is None:
+            return f"No concept block data for {code} (eastmoney cooldown)"
         d = r.json()
 
         diff = (d.get("data") or {}).get("diff") or {}
@@ -1878,6 +2015,9 @@ def get_fund_flow(
             "fields2": "f51,f52,f53,f54,f55,f56,f57",
         }
         r = _em_get(url_rt, params=params_rt, timeout=10)
+        if r is None:
+            lines.append("No realtime fund flow (eastmoney cooldown)")
+            return "\n".join(lines)
         d = r.json()
         klines = d.get("data", {}).get("klines", [])
 
@@ -1927,6 +2067,8 @@ def get_fund_flow(
                 "fields2": "f51,f52,f53,f54,f55,f56,f57",
             }
             rh = _em_get(url_hist, params=params_hist, timeout=10)
+            if rh is None:
+                return "\n".join(lines)
             dh = rh.json()
             hist_klines = dh.get("data", {}).get("klines", [])
 
@@ -1957,9 +2099,358 @@ def get_fund_flow(
         return f"Error fetching fund flow for {code}: {str(e)}"
 
 
+_MAIN_FORCE_WEAK_OUTFLOW_WAN = -5000.0
+_MAIN_FORCE_STRONG_INFLOW_WAN = 3000.0
+
+
+def _classify_main_force_signal(main_net_wan: float, main_net_5d_wan: float) -> str:
+    """Classify main-force flow as 强势/中性/弱势."""
+    if main_net_wan <= _MAIN_FORCE_WEAK_OUTFLOW_WAN:
+        return "弱势"
+    if main_net_wan >= _MAIN_FORCE_STRONG_INFLOW_WAN or main_net_5d_wan >= 8000:
+        return "强势"
+    return "中性"
+
+
+def _fetch_em_daily_fund_flow(code: str) -> list[dict]:
+    """Fetch daily main-force net inflow (万元) from 东财 push2his, session-cached."""
+    cache_key = ("em_daily_fund_flow", code)
+    if cache_key in _session_cache:
+        cached = _session_cache[cache_key]
+        return cached if isinstance(cached, list) else []
+
+    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+    rows: list[dict] = []
+    try:
+        url_hist = (
+            "https://push2his.eastmoney.com"
+            "/api/qt/stock/fflow/daykline/get"
+        )
+        params_hist = {
+            "secid": secid,
+            "lmt": 120,
+            "klt": 101,
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        }
+        rh = _em_get(url_hist, params=params_hist, timeout=10)
+        if rh is None:
+            _session_cache[cache_key] = rows
+            return rows
+        hist_klines = rh.json().get("data", {}).get("klines", []) or []
+        for line in hist_klines:
+            parts = line.split(",")
+            if len(parts) >= 2:
+                rows.append({
+                    "date": parts[0][:10],
+                    "main_wan": float(parts[1]) / 1e4,
+                })
+    except Exception as e:
+        logger.warning("_fetch_em_daily_fund_flow failed for %s: %s", code, e)
+
+    _session_cache[cache_key] = rows
+    return rows
+
+
+def _fetch_em_realtime_main_wan(code: str) -> float | None:
+    """Realtime minute-level main-force net inflow (万元), or None."""
+    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+    try:
+        url_rt = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+        params_rt = {
+            "secid": secid,
+            "klt": 1,
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+        }
+        r = _em_get(url_rt, params=params_rt, timeout=10)
+        if r is None:
+            return None
+        klines = r.json().get("data", {}).get("klines", []) or []
+        if not klines:
+            return None
+        last_parts = klines[-1].split(",")
+        if len(last_parts) >= 2:
+            return float(last_parts[1]) / 1e4
+    except Exception as e:
+        logger.warning("_fetch_em_realtime_main_wan failed for %s: %s", code, e)
+    return None
+
+
+def _get_main_force_flow_metrics(
+    ticker: str,
+    trade_date: str,
+) -> dict:
+    """Structured main-force flow for HardLogic (push2, no tool string parsing).
+
+    Returns:
+        {
+            "main_net_inflow_wan": float,
+            "main_net_5d_wan": float,
+            "flow_signal": str,  # 强势/中性/弱势 or ""
+            "data_confidence": "[确认]" | "[估算]" | "[无数据]",
+        }
+    """
+    code = _normalize_ticker(ticker)
+    empty = {
+        "main_net_inflow_wan": 0.0,
+        "main_net_5d_wan": 0.0,
+        "flow_signal": "",
+        "data_confidence": "[无数据]",
+    }
+    cache_key = ("main_force_flow_metrics", code, trade_date)
+    if cache_key in _session_cache:
+        cached = _session_cache[cache_key]
+        return cached if isinstance(cached, dict) else empty
+
+    daily = _fetch_em_daily_fund_flow(code)
+    target: dict | None = None
+    confidence = "[确认]"
+
+    if daily:
+        for row in daily:
+            if row["date"] == trade_date:
+                target = row
+                break
+        if target is None:
+            latest = daily[-1]
+            if latest["date"] <= trade_date:
+                target = latest
+                confidence = "[估算]" if latest["date"] != trade_date else "[确认]"
+    else:
+        rt_wan = _fetch_em_realtime_main_wan(code)
+        if rt_wan is not None:
+            signal = _classify_main_force_signal(rt_wan, rt_wan)
+            result = {
+                "main_net_inflow_wan": round(rt_wan, 1),
+                "main_net_5d_wan": round(rt_wan, 1),
+                "flow_signal": signal,
+                "data_confidence": "[估算]",
+            }
+            _session_cache[cache_key] = result
+            return result
+        _session_cache[cache_key] = empty
+        return empty
+
+    if target is None:
+        _session_cache[cache_key] = empty
+        return empty
+
+    main_wan = float(target["main_wan"])
+    idx = next(i for i, row in enumerate(daily) if row is target)
+    start = max(0, idx - 4)
+    main_5d = sum(float(row["main_wan"]) for row in daily[start : idx + 1])
+    result = {
+        "main_net_inflow_wan": round(main_wan, 1),
+        "main_net_5d_wan": round(main_5d, 1),
+        "flow_signal": _classify_main_force_signal(main_wan, main_5d),
+        "data_confidence": confidence,
+    }
+    _session_cache[cache_key] = result
+    return result
+
+
 # ---------------------------------------------------------------------------
 # 15. Dragon Tiger Board (龙虎榜)
 # ---------------------------------------------------------------------------
+
+_KNOWN_HOT_MONEY_SEATS: list[dict] | None = None
+
+
+def _known_hot_money_seats_path():
+    from pathlib import Path
+
+    return Path(__file__).resolve().parent.parent.parent / "data" / "known_hot_money_seats.json"
+
+
+def _load_known_hot_money_seats() -> list[dict]:
+    """Load一线游资席位库（进程内缓存）。"""
+    global _KNOWN_HOT_MONEY_SEATS
+    if _KNOWN_HOT_MONEY_SEATS is not None:
+        return _KNOWN_HOT_MONEY_SEATS
+
+    path = _known_hot_money_seats_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = _json.load(f)
+        _KNOWN_HOT_MONEY_SEATS = payload.get("seats", [])
+    except (OSError, _json.JSONDecodeError, TypeError):
+        logger.warning("known_hot_money_seats.json unavailable: %s", path)
+        _KNOWN_HOT_MONEY_SEATS = []
+    return _KNOWN_HOT_MONEY_SEATS
+
+
+def _match_hot_money_seat(operatedept_name: str) -> str | None:
+    """Match营业部名称到知名游资，返回游资简称。"""
+    if not operatedept_name:
+        return None
+    name = operatedept_name.strip()
+    for seat in _load_known_hot_money_seats():
+        for alias in seat.get("aliases", []):
+            if alias in name or name in alias:
+                return seat.get("name", alias)
+    return None
+
+
+def _empty_lhb_seat_metrics() -> dict:
+    return {
+        "on_lhb": False,
+        "lhb_date": "",
+        "hot_money_buy": False,
+        "hot_money_seats": [],
+        "inst_buy": 0.0,
+        "inst_sell": 0.0,
+        "inst_net": 0.0,
+        "institutional_net_wan": 0.0,
+        "has_data": False,
+    }
+
+
+def _compute_lhb_seat_metrics_from_rows(
+    code: str,
+    trade_date: str,
+    buy_data: list[dict],
+    sell_data: list[dict],
+) -> dict:
+    """从买卖席位明细行计算单股龙虎榜指标。"""
+    if not buy_data and not sell_data:
+        return _empty_lhb_seat_metrics()
+
+    hot_money_seats: list[str] = []
+    for row in buy_data:
+        if (row.get("BUY") or 0) <= 0:
+            continue
+        matched = _match_hot_money_seat(row.get("OPERATEDEPT_NAME", ""))
+        if matched and matched not in hot_money_seats:
+            hot_money_seats.append(matched)
+
+    inst_buy = 0.0
+    inst_sell = 0.0
+    for row in buy_data:
+        if str(row.get("OPERATEDEPT_CODE", "")) == "0":
+            inst_buy += float(row.get("BUY") or 0)
+    for row in sell_data:
+        if str(row.get("OPERATEDEPT_CODE", "")) == "0":
+            inst_sell += float(row.get("SELL") or 0)
+    inst_net = inst_buy - inst_sell
+
+    return {
+        "on_lhb": True,
+        "lhb_date": trade_date,
+        "hot_money_buy": bool(hot_money_seats),
+        "hot_money_seats": hot_money_seats,
+        "inst_buy": inst_buy,
+        "inst_sell": inst_sell,
+        "inst_net": inst_net,
+        "institutional_net_wan": round(inst_net / 10000, 1),
+        "has_data": True,
+    }
+
+
+def _build_lhb_seat_metrics_map(trade_date: str) -> dict[str, dict]:
+    """批量预取当日龙虎榜席位指标（扫描模式避免逐股东财请求）。"""
+    cache_key = ("lhb_seat_metrics_map", trade_date)
+    if cache_key in _session_cache:
+        cached = _session_cache[cache_key]
+        return cached if isinstance(cached, dict) else {}
+
+    result: dict[str, dict] = {}
+    try:
+        buy_rows = _eastmoney_datacenter(
+            "RPT_BILLBOARD_DAILYDETAILSBUY",
+            filter_str=f"(TRADE_DATE='{trade_date}')",
+            page_size=500,
+            sort_columns="BUY",
+            sort_types="-1",
+        )
+        sell_rows = _eastmoney_datacenter(
+            "RPT_BILLBOARD_DAILYDETAILSSELL",
+            filter_str=f"(TRADE_DATE='{trade_date}')",
+            page_size=500,
+            sort_columns="SELL",
+            sort_types="-1",
+        )
+    except Exception as e:
+        logger.warning("_build_lhb_seat_metrics_map failed for %s: %s", trade_date, e)
+        _session_cache[cache_key] = result
+        return result
+
+    buy_by_code: dict[str, list[dict]] = {}
+    for row in buy_rows or []:
+        code = str(row.get("SECURITY_CODE", "")).zfill(6)
+        if code:
+            buy_by_code.setdefault(code, []).append(row)
+
+    sell_by_code: dict[str, list[dict]] = {}
+    for row in sell_rows or []:
+        code = str(row.get("SECURITY_CODE", "")).zfill(6)
+        if code:
+            sell_by_code.setdefault(code, []).append(row)
+
+    for code in set(buy_by_code) | set(sell_by_code):
+        metrics = _compute_lhb_seat_metrics_from_rows(
+            code,
+            trade_date,
+            buy_by_code.get(code, []),
+            sell_by_code.get(code, []),
+        )
+        result[code] = metrics
+        _session_cache[("lhb_seat_metrics", code, trade_date)] = metrics
+
+    _session_cache[cache_key] = result
+    return result
+
+
+def _get_lhb_seat_metrics(ticker: str, trade_date: str) -> dict:
+    """结构化龙虎榜席位指标（当日上榜）。"""
+    code = safe_ticker_component(ticker)
+    empty = _empty_lhb_seat_metrics()
+    map_cache_key = ("lhb_seat_metrics_map", trade_date)
+    if map_cache_key in _session_cache:
+        lhb_map = _session_cache[map_cache_key]
+        if isinstance(lhb_map, dict):
+            return lhb_map.get(code, empty)
+
+    cache_key = ("lhb_seat_metrics", code, trade_date)
+    if cache_key in _session_cache:
+        cached = _session_cache[cache_key]
+        return cached if isinstance(cached, dict) else empty
+
+    try:
+        appearances = _eastmoney_datacenter(
+            "RPT_DAILYBILLBOARD_DETAILSNEW",
+            filter_str=f"(TRADE_DATE='{trade_date}')(SECURITY_CODE=\"{code}\")",
+            page_size=5,
+        )
+        if not appearances:
+            _session_cache[cache_key] = empty
+            return empty
+
+        buy_data = _eastmoney_datacenter(
+            "RPT_BILLBOARD_DAILYDETAILSBUY",
+            filter_str=f"(TRADE_DATE='{trade_date}')(SECURITY_CODE=\"{code}\")",
+            page_size=10,
+            sort_columns="BUY",
+            sort_types="-1",
+        )
+        sell_data = _eastmoney_datacenter(
+            "RPT_BILLBOARD_DAILYDETAILSSELL",
+            filter_str=f"(TRADE_DATE='{trade_date}')(SECURITY_CODE=\"{code}\")",
+            page_size=10,
+            sort_columns="SELL",
+            sort_types="-1",
+        )
+    except Exception as e:
+        logger.warning("_get_lhb_seat_metrics failed for %s %s: %s", code, trade_date, e)
+        _session_cache[cache_key] = empty
+        return empty
+
+    result = _compute_lhb_seat_metrics_from_rows(
+        code, trade_date, buy_data or [], sell_data or []
+    )
+    _session_cache[cache_key] = result
+    return result
+
 
 def get_dragon_tiger_board(
     ticker: str,
@@ -2091,16 +2582,90 @@ def get_dragon_tiger_board(
 # 16. Lockup Expiry Calendar (限售解禁日历)
 # ---------------------------------------------------------------------------
 
+def _parse_free_ratio(value) -> float:
+    """Parse eastmoney FREE_RATIO field to percentage float."""
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("%", "").replace("％", "")
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _get_unlock_pressure_metrics(
+    ticker: str,
+    curr_date: str,
+    forward_days: int = 30,
+) -> dict:
+    """Structured unlock pressure for HardLogic (sum of FREE_RATIO in window).
+
+    Returns:
+        {
+            "unlock_pressure_pct": float,  # 0 when no upcoming unlocks
+            "has_data": bool,              # False when API empty or failed
+            "upcoming_count": int,
+            "events": list[dict],
+        }
+    """
+    code = safe_ticker_component(ticker)
+    empty = {
+        "unlock_pressure_pct": 0.0,
+        "has_data": False,
+        "upcoming_count": 0,
+        "events": [],
+    }
+    try:
+        end_dt = datetime.strptime(curr_date, "%Y-%m-%d") + pd.Timedelta(days=forward_days)
+        end_str = end_dt.strftime("%Y-%m-%d")
+        upcoming_data = _eastmoney_datacenter(
+            "RPT_LIFT_STAGE",
+            filter_str=(
+                f"(SECURITY_CODE=\"{code}\")"
+                f"(FREE_DATE>='{curr_date}')"
+                f"(FREE_DATE<='{end_str}')"
+            ),
+            page_size=20,
+            sort_columns="FREE_DATE",
+            sort_types="1",
+        )
+    except Exception:
+        return empty
+
+    if not upcoming_data:
+        return empty
+
+    events: list[dict] = []
+    total_ratio = 0.0
+    for row in upcoming_data:
+        ratio = _parse_free_ratio(row.get("FREE_RATIO"))
+        total_ratio += ratio
+        events.append({
+            "date": str(row.get("FREE_DATE", ""))[:10],
+            "type": row.get("LIMITED_STOCK_TYPE", ""),
+            "ratio_pct": ratio,
+        })
+
+    return {
+        "unlock_pressure_pct": round(total_ratio, 2),
+        "has_data": True,
+        "upcoming_count": len(events),
+        "events": events,
+    }
+
+
 def get_lockup_expiry(
     ticker: str,
-    trade_date: str,
+    curr_date: str,
     forward_days: int = 90,
 ) -> str:
     """Get lockup expiry schedule for a stock.
 
     Args:
         ticker: 6-digit A-share code
-        trade_date: YYYY-MM-DD
+        curr_date: YYYY-MM-DD
         forward_days: how many days forward to check (default 90)
 
     Returns:
@@ -2108,7 +2673,7 @@ def get_lockup_expiry(
         expiry calendar with impact metrics.
     """
     code = safe_ticker_component(ticker)
-    lines = [f"# 限售解禁日历 | {code} | {trade_date}"]
+    lines = [f"# 限售解禁日历 | {code} | {curr_date}"]
 
     # 1. 历史解禁记录 — eastmoney datacenter direct HTTP
     try:
@@ -2136,7 +2701,7 @@ def get_lockup_expiry(
 
     # 2. 未来待解禁 — eastmoney datacenter direct HTTP
     try:
-        end_dt = datetime.strptime(trade_date, "%Y-%m-%d") + pd.Timedelta(
+        end_dt = datetime.strptime(curr_date, "%Y-%m-%d") + pd.Timedelta(
             days=forward_days
         )
         end_str = end_dt.strftime("%Y-%m-%d")
@@ -2144,7 +2709,7 @@ def get_lockup_expiry(
             "RPT_LIFT_STAGE",
             filter_str=(
                 f"(SECURITY_CODE=\"{code}\")"
-                f"(FREE_DATE>='{trade_date}')"
+                f"(FREE_DATE>='{curr_date}')"
                 f"(FREE_DATE<='{end_str}')"
             ),
             page_size=20,
@@ -2174,14 +2739,14 @@ def get_lockup_expiry(
 
 def get_industry_comparison(
     ticker: str,
-    trade_date: str,
+    curr_date: str,
     top_n: int = 20,
 ) -> str:
     """Get industry sector performance comparison.
 
     Args:
         ticker: 6-digit A-share code (used to identify relevant sector)
-        trade_date: YYYY-MM-DD
+        curr_date: YYYY-MM-DD
         top_n: number of top/bottom industries to show (default 20)
 
     Returns:
@@ -2189,7 +2754,7 @@ def get_industry_comparison(
         the sector the target stock belongs to.
     """
     code = safe_ticker_component(ticker)
-    lines = [f"# 行业横向对比 | {code} | {trade_date}"]
+    lines = [f"# 行业横向对比 | {code} | {curr_date}"]
 
     # 东财 push2 行业板块排名 (direct HTTP, replaces 同花顺 which has 401)
     try:
@@ -2205,8 +2770,12 @@ def get_industry_comparison(
             "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207",
         }
         r = _em_get(url, params=params, timeout=15)
-        d = r.json()
-        items = d.get("data", {}).get("diff", [])
+        if r is None:
+            lines.append("\n(东财行业数据暂不可用)")
+            items = []
+        else:
+            d = r.json()
+            items = d.get("data", {}).get("diff", [])
 
         if items:
             lines.append(
@@ -2559,6 +3128,8 @@ def get_research_reports(
                 headers={"Referer": "https://data.eastmoney.com/"},
                 timeout=30,
             )
+            if r is None:
+                break
             d = r.json()
             rows = d.get("data") or []
             if not rows:
@@ -3007,7 +3578,7 @@ def _get_limitup_stocks_ths(trade_date: str) -> list[dict]:
                 "Chrome/117.0.0.0 Safari/537.36"
             )
         }
-        r = _requests.get(url, headers=headers, timeout=10)
+        r = _direct_get(url, headers=headers, timeout=10)
         data = r.json()
 
         if data.get("errocode", 0) != 0:
@@ -3032,8 +3603,148 @@ def _get_limitup_stocks_ths(trade_date: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# P1-02: 涨停价 / 连板判断（支持 5%/10%/20%/30% 多档涨跌幅）
+# P1-01b: 东财 push2ex 涨停股池（官方连板数 lbc）
 # ---------------------------------------------------------------------------
+
+_EM_PUSH2EX_UT = "7eea3edcaed734bea9cbfc24409ed989"
+_EM_PUSH2EX_BASE = "https://push2ex.eastmoney.com"
+
+
+def _format_em_seal_time(raw) -> str:
+    """将东财封板时间整数转为 HH:MM:SS（如 92500 → 09:25:00）。"""
+    if raw is None:
+        return ""
+    s = str(int(raw)).zfill(6)
+    return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
+
+
+def _em_push2ex_pool(
+    endpoint: str,
+    trade_date: str,
+    sort: str,
+    page_size: int = 10000,
+) -> list[dict]:
+    """调用东财 push2ex 题材股池接口，返回 data.pool 列表。
+
+    数据源: push2ex.eastmoney.com（走 _em_get 限流）
+    有效范围: 约最近 2 周（更早日期返回空 pool）
+    """
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    date_fmt = trade_date.replace("-", "")
+    url = f"{_EM_PUSH2EX_BASE}/{endpoint}"
+    params = {
+        "ut": _EM_PUSH2EX_UT,
+        "dpt": "wz.ztzt",
+        "Pageindex": "0",
+        "pagesize": str(page_size),
+        "sort": sort,
+        "date": date_fmt,
+    }
+    headers = {"Referer": "https://quote.eastmoney.com/ztb/detail"}
+    try:
+        r = _em_get(url, params=params, headers=headers, timeout=15)
+        if r is None:
+            logger.warning("_em_push2ex_pool: _em_get returned None for %s", endpoint)
+            return []
+        data = r.json()
+        pool = (data.get("data") or {}).get("pool")
+        if not pool:
+            return []
+        return pool
+    except Exception as e:
+        logger.warning("_em_push2ex_pool failed for %s/%s: %s", endpoint, trade_date, e)
+        return []
+
+
+def _parse_em_zt_pool_row(row: dict) -> dict:
+    """解析东财涨停股池单条记录为项目标准 dict。"""
+    code = str(row.get("c", "")).strip()
+    fbt = row.get("fbt")
+    lbt = row.get("lbt")
+    zbc = int(row.get("zbc") or 0)
+    hs = float(row.get("hs") or 0)
+    # 东财 hs 单位为 %（如 0.93 表示 0.93%），项目内 turnover_rate 用小数
+    turnover_rate = hs / 100.0 if hs > 0 else 0.0
+    first_limit_time = _format_em_seal_time(fbt)
+    # 一字板：首次封板在 9:30 前/等于开盘且未炸板
+    limit_type = "一字" if zbc == 0 and int(fbt or 999999) <= 93000 else "换手"
+    zttj = row.get("zttj") or {}
+    limit_stat = ""
+    if isinstance(zttj, dict) and zttj.get("days") is not None:
+        limit_stat = f"{zttj.get('days')}/{zttj.get('ct')}"
+    return {
+        "code": code,
+        "name": str(row.get("n", "")).strip(),
+        "reason": "",
+        "consecutive_days": int(row.get("lbc") or 0),
+        "limit_type": limit_type,
+        "circulation_mv": float(row.get("ltsz") or 0),
+        "total_mv": float(row.get("tshare") or 0),
+        "turnover_rate": turnover_rate,
+        "amount": float(row.get("amount") or 0),
+        "seal_amount": float(row.get("fund") or 0),
+        "open_times": zbc,
+        "first_limit_time": first_limit_time,
+        "last_limit_time": _format_em_seal_time(lbt),
+        "change_pct": float(row.get("zdp") or 0),
+        "price": float(row.get("p") or 0) / 1000.0,
+        "industry": str(row.get("hybk") or "").strip(),
+        "limit_stat": limit_stat,
+    }
+
+
+def _get_limitup_stocks_em(trade_date: str) -> dict[str, dict]:
+    """从东财 push2ex 涨停股池获取涨停列表（含官方连板数 lbc）。
+
+    返回: {code: {...}} 字典，便于与同花顺 getharden 按 code 合并。
+    不含 ST 及科创板（东财池规则）。
+
+    数据源: push2ex getTopicZTPool
+    限流: _em_get()
+    """
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+
+    cache_key = ("limitup_em", trade_date)
+    if cache_key in _session_cache:
+        return _session_cache[cache_key]
+
+    pool = _em_push2ex_pool("getTopicZTPool", trade_date, sort="fbt:asc")
+    result: dict[str, dict] = {}
+    for row in pool:
+        parsed = _parse_em_zt_pool_row(row)
+        if parsed["code"]:
+            result[parsed["code"]] = parsed
+
+    _session_cache[cache_key] = result
+    return result
+
+
+def _get_broken_board_stocks_em(trade_date: str) -> list[dict]:
+    """从东财 push2ex 炸板股池获取炸板列表（供封板质量/炸板率使用）。"""
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    cache_key = ("broken_board_em", trade_date)
+    if cache_key in _session_cache:
+        return _session_cache[cache_key]
+
+    pool = _em_push2ex_pool("getTopicZBPool", trade_date, sort="fbt:asc")
+    result = []
+    for row in pool:
+        code = str(row.get("c", "")).strip()
+        if not code:
+            continue
+        result.append({
+            "code": code,
+            "name": str(row.get("n", "")).strip(),
+            "open_times": int(row.get("zbc") or 0),
+            "first_limit_time": _format_em_seal_time(row.get("fbt")),
+            "change_pct": float(row.get("zdp") or 0),
+        })
+    _session_cache[cache_key] = result
+    return result
+
 
 _LIMIT_UP_RATIOS = (0.05, 0.10, 0.20, 0.30)
 _LIMIT_UP_TOLERANCE = 0.015
@@ -3164,62 +3875,153 @@ def _non_st_limitup_stocks(limitup_stocks: list[dict]) -> list[dict]:
     return [s for s in limitup_stocks if not _is_st_stock(s.get("name", ""))]
 
 
-def _enrich_limitup_stock(stock: dict, trade_date: str, em_quotes: dict) -> dict:
-    """为单个涨停股补充连板天数、涨停类型和东财行情数据。"""
+def _enrich_limitup_stock(
+    stock: dict,
+    trade_date: str,
+    em_pool: dict[str, dict],
+    em_quotes: dict,
+) -> dict:
+    """为单个涨停股补充连板天数、涨停类型和行情数据。
+
+    优先级: 东财 push2ex lbc > K 线回溯；涨停原因来自同花顺 getharden。
+    """
     code = stock["code"]
-    # 北交所股票（8/9开头）mootdx 不支持，跳过 K 线查询
-    if _is_bse_code(code):
+    em_data = em_pool.get(code, {})
+    reason = stock.get("reason") or em_data.get("reason", "")
+
+    if em_data.get("consecutive_days", 0) > 0:
+        consecutive_days = em_data["consecutive_days"]
+        limit_type = em_data.get("limit_type", "换手")
+        first_limit_time = em_data.get("first_limit_time", "")
+        last_limit_time = em_data.get("last_limit_time", "")
+        open_times = em_data.get("open_times", 0)
+        seal_amount = em_data.get("seal_amount", 0)
+        circulation_mv = em_data.get("circulation_mv", 0)
+        turnover_rate = em_data.get("turnover_rate", 0)
+        amount = em_data.get("amount", 0)
+        open_times_confirmed = True
+        first_limit_time_confirmed = bool(first_limit_time)
+    elif _is_bse_code(code):
         consecutive_days = 0
         limit_type = "换手"
+        first_limit_time = last_limit_time = ""
+        open_times = 0
+        seal_amount = 0
+        circulation_mv = turnover_rate = amount = 0
+        open_times_confirmed = False
+        first_limit_time_confirmed = False
+    elif _is_st_stock(stock.get("name", "")):
+        # 东财涨停池不含 ST；同花顺独有 ST 标的默认当日 1 板，避免 mootdx K 线阻塞
+        consecutive_days = 1
+        limit_type = "换手"
+        first_limit_time = last_limit_time = ""
+        open_times = 0
+        seal_amount = 0
+        circulation_mv = turnover_rate = amount = 0
+        open_times_confirmed = False
+        first_limit_time_confirmed = False
     else:
         consecutive_days = _calculate_consecutive_days(code, trade_date)
         kline_info = _detect_limitup_from_kline(code, trade_date)
         limit_type = "一字" if kline_info.get("is_yizi") else "换手"
-    em_data = em_quotes.get(code, {})
+        first_limit_time = last_limit_time = ""
+        open_times = 0
+        seal_amount = 0
+        circulation_mv = turnover_rate = amount = 0
+        open_times_confirmed = False
+        first_limit_time_confirmed = False
+
+    # xuangu 补充 EM 池缺失的行情字段
+    xuangu = em_quotes.get(code, {})
+    if not circulation_mv:
+        circulation_mv = xuangu.get("circulation_mv", 0)
+    if not turnover_rate:
+        turnover_rate = xuangu.get("turnover_rate", 0)
+    if not amount:
+        amount = xuangu.get("amount", 0)
+
+    name = stock.get("name") or em_data.get("name", "")
+
     return {
         "code": code,
-        "name": stock["name"],
-        "reason": stock["reason"],
+        "name": name,
+        "reason": reason,
         "consecutive_days": consecutive_days,
         "limit_type": limit_type,
-        "circulation_mv": em_data.get("circulation_mv", 0),
-        "turnover_rate": em_data.get("turnover_rate", 0),
-        "amount": em_data.get("amount", 0),
+        "circulation_mv": circulation_mv,
+        "turnover_rate": turnover_rate,
+        "amount": amount,
+        "first_limit_time": first_limit_time,
+        "first_limit_time_confirmed": first_limit_time_confirmed,
+        "last_limit_time": last_limit_time,
+        "open_times": open_times,
+        "open_times_confirmed": open_times_confirmed,
+        "seal_amount": seal_amount,
     }
+
+
+def _merge_limitup_sources(trade_date: str) -> list[dict]:
+    """合并东财涨停池 + 同花顺 getharden，按 code 并集。"""
+    em_pool = _get_limitup_stocks_em(trade_date)
+    ths_stocks = _get_limitup_stocks_ths(trade_date)
+
+    ths_by_code = {s["code"]: s for s in ths_stocks}
+    all_codes: list[str] = []
+    seen: set[str] = set()
+    for code in list(em_pool.keys()) + list(ths_by_code.keys()):
+        if code and code not in seen:
+            seen.add(code)
+            all_codes.append(code)
+
+    if not all_codes:
+        return []
+
+    em_quotes = _get_em_xuangu_quotes(all_codes[:50])
+    # xuangu 单次最多 50 只，分批补充 THS 独有股票
+    if len(all_codes) > 50:
+        for i in range(50, len(all_codes), 50):
+            em_quotes.update(_get_em_xuangu_quotes(all_codes[i:i + 50]))
+
+    result = []
+    for code in all_codes:
+        ths = ths_by_code.get(code, {})
+        em = em_pool.get(code, {})
+        stock = {
+            "code": code,
+            "name": ths.get("name") or em.get("name", ""),
+            "reason": ths.get("reason", ""),
+        }
+        result.append(_enrich_limitup_stock(stock, trade_date, em_pool, em_quotes))
+    return result
 
 
 def _get_limitup_stocks(trade_date: str) -> list[dict]:
     """获取当日涨停股票列表（含连板天数、涨停类型等）。
 
     整合数据源:
-    - 同花顺 getharden: 涨停股列表 + 涨停原因
-    - mootdx K线: 连板天数 + 涨停类型（一字/换手）
-    - 东财选股接口: 补充流通市值、换手率、成交额等
+    - 东财 push2ex getTopicZTPool: 官方连板数 lbc + 封板时间/炸板次数/封单
+    - 同花顺 getharden: 涨停原因 + ST 等 EM 池未覆盖标的
+    - mootdx K线: fallback 连板天数（EM 无数据或超出 ~2 周窗口时）
+    - 东财选股接口: 补充流通市值、换手率、成交额
 
     返回:
         [{"code": "000001", "name": "平安银行", "reason": "AI概念",
           "consecutive_days": 3, "limit_type": "换手",
+          "first_limit_time": "09:35:00", "open_times": 0, "seal_amount": 5e7,
           "circulation_mv": 5000000000, "turnover_rate": 0.08,
           "amount": 200000000}, ...]
 
-    数据源: 同花顺 getharden + mootdx K线 + 东财选股接口
-    限流: _em_get()（仅东财部分）
+    数据源: 东财 push2ex + 同花顺 getharden + mootdx K线 + 东财选股
+    限流: _em_get()（东财部分）
     """
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+
     cache_key = ("limitup", trade_date)
     if cache_key in _session_cache:
         return _session_cache[cache_key]
     try:
-        ths_stocks = _get_limitup_stocks_ths(trade_date)
-        if not ths_stocks:
-            return []
-
-        codes = [s["code"] for s in ths_stocks]
-        em_quotes = _get_em_xuangu_quotes(codes)
-
-        result = [
-            _enrich_limitup_stock(stock, trade_date, em_quotes)
-            for stock in ths_stocks
-        ]
+        result = _merge_limitup_sources(trade_date)
         _session_cache[cache_key] = result
         return result
 
@@ -3282,15 +4084,40 @@ def _get_em_xuangu_quotes(codes: list[str]) -> dict[str, dict]:
 # P1-05: 跌停获取
 # ---------------------------------------------------------------------------
 
-def _get_limitdown_stocks(trade_date: str) -> list[dict]:
-    """获取当日跌停股票列表。
+def _get_limitdown_stocks_em(trade_date: str) -> list[dict]:
+    """从东财 push2ex 跌停股池获取历史/当日跌停列表。"""
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
 
-    使用东财选股接口筛选跌幅>=-9.9%的股票作为跌停近似。
+    cache_key = ("limitdown_em", trade_date)
+    if cache_key in _session_cache:
+        return _session_cache[cache_key]
+
+    pool = _em_push2ex_pool("getTopicDTPool", trade_date, sort="fund:asc")
+    result = []
+    for row in pool:
+        code = str(row.get("c", "")).strip()
+        if not code:
+            continue
+        result.append({
+            "code": code,
+            "name": str(row.get("n", "")).strip(),
+            "change_rate": float(row.get("zdp") or 0),
+        })
+    _session_cache[cache_key] = result
+    return result
+
+
+def _get_limitdown_stocks(trade_date: str) -> list[dict]:
+    """获取指定交易日跌停股票列表。
+
+    优先东财 push2ex 跌停池（支持近 ~2 周历史 trade_date）；
+    池为空且为当日时回退东财选股实时筛选。
 
     返回:
         [{"code": "000001", "name": "平安银行", "change_rate": -10.0}, ...]
 
-    数据源: 东财选股接口
+    数据源: 东财 push2ex getTopicDTPool / 东财选股
     限流: _em_get()
     """
     if not trade_date or trade_date.strip() == "":
@@ -3299,6 +4126,16 @@ def _get_limitdown_stocks(trade_date: str) -> list[dict]:
     cache_key = ("limitdown", trade_date)
     if cache_key in _session_cache:
         return _session_cache[cache_key]
+
+    em_result = _get_limitdown_stocks_em(trade_date)
+    if em_result:
+        _session_cache[cache_key] = em_result
+        return em_result
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    if trade_date != today:
+        _session_cache[cache_key] = []
+        return []
 
     try:
         url = "https://data.eastmoney.com/dataapi/xuangu/list"
@@ -3370,19 +4207,47 @@ def _get_first_board_stocks(trade_date: str) -> list[dict]:
         if stock.get("consecutive_days", 0) != 1:
             continue
 
-        # 获取首板涨停时间（从K线判断开盘即涨停还是盘中封板）
+        # 获取首板涨停时间：东财 fbt 优先，否则 K 线估算
         code = stock["code"]
-        first_limit_time = _estimate_first_limit_time(code, trade_date, stock.get("limit_type", ""))
+        if stock.get("first_limit_time") and stock.get("first_limit_time_confirmed"):
+            first_limit_time = stock["first_limit_time"]
+            first_limit_time_confirmed = True
+        elif stock.get("first_limit_time"):
+            first_limit_time = stock["first_limit_time"]
+            first_limit_time_confirmed = False
+        else:
+            first_limit_time = _estimate_first_limit_time(
+                code,
+                trade_date,
+                stock.get("limit_type", ""),
+                stock.get("name", ""),
+            )
+            first_limit_time_confirmed = False
+
+        first_limit_sources = (
+            {"first_limit_time": "[确认]"}
+            if first_limit_time_confirmed
+            else {"first_limit_time": "[估算]"}
+        )
 
         first_boards.append({
             **stock,
             "first_limit_time": first_limit_time,
+            "first_limit_time_confirmed": first_limit_time_confirmed,
+            "data_sources": _merge_field_data_sources(
+                stock.get("data_sources"), first_limit_sources
+            ),
         })
 
     return first_boards
 
 
-def _estimate_first_limit_time(code: str, trade_date: str, limit_type: str) -> str:
+def _estimate_first_limit_time(
+    code: str,
+    trade_date: str,
+    limit_type: str,
+    name: str = "",
+) -> str:
     """估算首板涨停时间。
 
     逻辑:
@@ -3393,6 +4258,8 @@ def _estimate_first_limit_time(code: str, trade_date: str, limit_type: str) -> s
     """
     if limit_type == "一字":
         return "09:30"
+    if _is_st_stock(name):
+        return "10:00"
 
     try:
         code = _normalize_ticker(code)
@@ -3424,24 +4291,42 @@ def _estimate_first_limit_time(code: str, trade_date: str, limit_type: str) -> s
 # P4-02: 封单信息获取
 # ---------------------------------------------------------------------------
 
-def _get_stock_seal_info(stock: dict) -> dict:
-    """获取个股封单信息（简化版，基于可用数据估算）。
+def _source_suffix(data_sources: dict | None, field: str) -> str:
+    """返回字段置信度后缀，如 ' [确认]'。"""
+    tag = (data_sources or {}).get(field, "")
+    return f" {tag}" if tag else ""
 
-    数据限制说明:
-    - 封单金额（seal_amount）不可直接获取，改用换手率/封板类型估算
-    - 封单稳定性（seal_stability）需要分时K线，此处返回 None
+
+def _merge_field_data_sources(*sources: dict | None) -> dict[str, str]:
+    """合并多个 data_sources 字典（后者覆盖前者）。"""
+    merged: dict[str, str] = {}
+    for src in sources:
+        if src:
+            merged.update(src)
+    return merged
+
+
+def _get_stock_seal_info(stock: dict) -> dict:
+    """获取个股封单信息。
+
+    封单比优先级:
+    1. 东财 seal_amount / circulation_mv → [确认]
+    2. 成交额 / circulation_mv → [估算]
+    3. 无流通市值 → 0 + [估算]
 
     返回:
         {"seal_strength_score": float (0-100),
-         "seal_ratio": float (估算值),
-         "board_type": str}
+         "seal_ratio": float,
+         "board_type": str,
+         "data_sources": {"seal_ratio": "[确认]" | "[估算]"}}
 
-    数据源: 复用已有涨停数据
+    数据源: 东财 push2ex 涨停池 + 已有行情字段
     """
     turnover_rate = stock.get("turnover_rate", 0)
     limit_type = stock.get("limit_type", "换手")
-    amount = stock.get("amount", 0)
-    circulation_mv = stock.get("circulation_mv", 0)
+    amount = stock.get("amount", 0) or 0
+    circulation_mv = stock.get("circulation_mv", 0) or 0
+    seal_amount = stock.get("seal_amount", 0) or 0
 
     # 封单强度评分（0-100）
     # 核心逻辑: 低换手 + 涨停 = 强封板
@@ -3467,16 +4352,23 @@ def _get_stock_seal_info(stock: dict) -> dict:
     elif limit_type == "T字":
         score += 5   # T字板次之
 
-    # 封单/流通盘比估算（用成交额/流通市值近似）
-    seal_ratio = 0.0
-    if circulation_mv > 0:
+    data_sources: dict[str, str] = {}
+    if seal_amount > 0 and circulation_mv > 0:
+        seal_ratio = round(seal_amount / circulation_mv * 100, 2)
+        data_sources["seal_ratio"] = "[确认]"
+    elif circulation_mv > 0 and amount > 0:
         seal_ratio = round(amount / circulation_mv * 100, 2)
+        data_sources["seal_ratio"] = "[估算]"
+    else:
+        seal_ratio = 0.0
+        data_sources["seal_ratio"] = "[估算]"
 
     return {
         "seal_strength_score": max(0, min(100, score)),
         "seal_ratio": seal_ratio,
         "board_type": limit_type,
         "seal_stability": None,  # 需要分时K线，暂不可获取
+        "data_sources": data_sources,
     }
 
 
@@ -3484,7 +4376,11 @@ def _get_stock_seal_info(stock: dict) -> dict:
 # P4-03: 历史股性评分
 # ---------------------------------------------------------------------------
 
-def _get_historical_activity(code: str, lookback_days: int = 240) -> float:
+def _get_historical_activity(
+    code: str,
+    lookback_days: int = 240,
+    as_of_date: str = "",
+) -> float:
     """获取历史股性评分（近1年涨停次数）。
 
     逻辑:
@@ -3498,7 +4394,8 @@ def _get_historical_activity(code: str, lookback_days: int = 240) -> float:
     """
     try:
         code = _normalize_ticker(code)
-        df = _load_ohlcv_astock(code, datetime.now().strftime("%Y-%m-%d"))
+        cutoff_date = as_of_date.strip() or datetime.now().strftime("%Y-%m-%d")
+        df = _load_ohlcv_astock(code, cutoff_date)
         if df is None or df.empty or len(df) < 2:
             return 30.0  # 默认一般股性
 
@@ -3685,6 +4582,8 @@ def calculate_second_board_score(
     first_limit_time: str = "",
     theme_purity: float = 0,
     historical_activity: float = 0,
+    hot_money_boost: float = 0,
+    main_force_penalty: float = 0,
 ) -> float:
     """二板预期评分（七因子模型）。
 
@@ -3696,6 +4595,7 @@ def calculate_second_board_score(
     5. 首板时间: 10%
     6. 题材纯正度: 5%
     7. 历史股性: 5%
+    8. 龙虎榜知名游资买入: +10（可选 hot_money_boost）
 
     特殊调整:
     - 一字板: -10分（开板风险高）
@@ -3755,6 +4655,9 @@ def calculate_second_board_score(
     elif first_limit_time and first_limit_time > "13:00":
         score -= 5
 
+    score += hot_money_boost
+    score += main_force_penalty
+
     return round(max(0, min(100, score)), 1)
 
 
@@ -3785,99 +4688,117 @@ def get_first_board_screen(
         trade_date = datetime.now().strftime("%Y-%m-%d")
 
     try:
-        # 1. 获取首板股票
-        first_boards = _get_first_board_stocks(trade_date)
-        if not first_boards:
+        scored_stocks, market_emotion, emotion_metrics = _build_scored_first_board_stocks(
+            trade_date,
+        )
+        if not scored_stocks:
             return f"无首板数据（非交易日或盘后未更新）| {trade_date}"
 
-        # 2. 获取市场情绪（复用情绪量化）
-        emotion_metrics = _calculate_emotion_metrics(
-            _get_limitup_stocks(trade_date),
-            _get_limitdown_stocks(trade_date),
-            _get_yesterday_limitup_performance(trade_date),
-            _get_market_breadth(trade_date),
-            _get_northbound_flow_signal(trade_date),
-        )
-        market_emotion = emotion_metrics.get("emotion_phase", "修复")
-
-        # 3. 获取题材数据（用于热度和纯正度）
-        theme_map = _get_limitup_by_theme(trade_date)
-
-        # 4. 构建题材热度查找表
-        theme_heat_map: dict[str, float] = {}
-        for theme_name, theme_stocks in theme_map.items():
-            stock_count = len(theme_stocks)
-            highest_board = max((s.get("board_num", 0) for s in theme_stocks), default=0)
-            heat = min(100, stock_count * 8 + highest_board * 15)
-            theme_heat_map[theme_name] = heat
-
-        # 5. 逐票计算二板预期评分
-        scored_stocks: list[dict] = []
-        for stock in first_boards:
-            code = stock["code"]
-
-            # 封单信息
-            seal_info = _get_stock_seal_info(stock)
-
-            # 量价配合
-            volume_score = _calculate_volume_match_score(
-                turnover_rate=stock.get("turnover_rate", 0),
-                amount=stock.get("amount", 0),
-            )
-
-            # 题材热度（取最高热度）
-            raw_reason = stock.get("reason", "")
-            reasons = [r.strip() for r in raw_reason.replace("，", "+").split("+") if r.strip()]
-            max_theme_heat = 0
-            best_theme = ""
-            for reason in reasons:
-                normalized = _normalize_theme_name(reason)
-                heat = theme_heat_map.get(normalized, 0)
-                if heat > max_theme_heat:
-                    max_theme_heat = heat
-                    best_theme = normalized
-
-            # 题材纯正度
-            theme_stocks = theme_map.get(best_theme, [])
-            purity = _calculate_theme_purity(code, best_theme, theme_stocks, theme_map)
-
-            # 历史股性
-            activity = _get_historical_activity(code)
-
-            # 二板预期评分
-            second_board_score = calculate_second_board_score(
-                seal_strength=seal_info["seal_strength_score"],
-                volume_match=volume_score,
-                theme_heat=max_theme_heat,
-                board_type=seal_info["board_type"],
-                market_emotion=market_emotion,
-                circulation_mv=stock.get("circulation_mv", 0),
-                first_limit_time=stock.get("first_limit_time", ""),
-                theme_purity=purity,
-                historical_activity=activity,
-            )
-
-            scored_stocks.append({
-                **stock,
-                "seal_info": seal_info,
-                "volume_score": volume_score,
-                "theme_heat": max_theme_heat,
-                "best_theme": best_theme,
-                "theme_purity": purity,
-                "historical_activity": activity,
-                "second_board_score": second_board_score,
-            })
-
-        # 6. 按二板预期评分排序
         scored_stocks.sort(key=lambda x: x["second_board_score"], reverse=True)
 
-        # 7. 格式化输出
         return _format_first_board_screen(
             scored_stocks, trade_date, min_score, market_emotion, emotion_metrics
         )
 
     except Exception as e:
         return f"首板筛选失败 ({trade_date}): {str(e)}"
+
+
+def _build_scored_first_board_stocks(trade_date: str) -> tuple[list[dict], str, dict]:
+    """构建首板评分列表（供 get_first_board_screen / scan 复用）。"""
+    first_boards = _get_first_board_stocks(trade_date)
+    if not first_boards:
+        return [], "", {}
+
+    yesterday_raw = _get_yesterday_limitup_performance(trade_date)
+    yesterday_perf = _calculate_yesterday_performance(yesterday_raw)
+    emotion_metrics = _calculate_emotion_metrics(
+        _get_limitup_stocks(trade_date),
+        _get_limitdown_stocks(trade_date),
+        yesterday_perf,
+        _get_market_breadth(trade_date),
+        _get_northbound_flow_signal(trade_date),
+        recent_2day_data=_build_recent_2day_emotion_data(trade_date),
+        trade_date=trade_date,
+    )
+    market_emotion = emotion_metrics.get("emotion_phase", "修复")
+    theme_map = _get_limitup_by_theme(trade_date)
+
+    theme_heat_map: dict[str, float] = {}
+    for theme_name, theme_stocks in theme_map.items():
+        stock_count = len(theme_stocks)
+        highest_board = max((s.get("board_num", 0) for s in theme_stocks), default=0)
+        heat = min(100, stock_count * 8 + highest_board * 15)
+        theme_heat_map[theme_name] = heat
+
+    lhb_metrics_map = _build_lhb_seat_metrics_map(trade_date)
+
+    scored_stocks: list[dict] = []
+    for stock in first_boards:
+        code = stock["code"]
+        seal_info = _get_stock_seal_info(stock)
+        volume_score = _calculate_volume_match_score(
+            turnover_rate=stock.get("turnover_rate", 0),
+            amount=stock.get("amount", 0),
+        )
+        raw_reason = stock.get("reason", "")
+        reasons = [r.strip() for r in raw_reason.replace("，", "+").split("+") if r.strip()]
+        max_theme_heat = 0
+        best_theme = ""
+        for reason in reasons:
+            normalized = _normalize_theme_name(reason)
+            heat = theme_heat_map.get(normalized, 0)
+            if heat > max_theme_heat:
+                max_theme_heat = heat
+                best_theme = normalized
+        theme_stocks = theme_map.get(best_theme, [])
+        purity = _calculate_theme_purity(code, best_theme, theme_stocks, theme_map)
+        activity = _get_historical_activity(code, as_of_date=trade_date)
+        lhb_metrics = _get_lhb_seat_metrics(code, trade_date)
+        hot_money_boost = 10.0 if lhb_metrics.get("hot_money_buy") else 0.0
+        second_board_score = calculate_second_board_score(
+            seal_strength=seal_info["seal_strength_score"],
+            volume_match=volume_score,
+            theme_heat=max_theme_heat,
+            board_type=seal_info["board_type"],
+            market_emotion=market_emotion,
+            circulation_mv=stock.get("circulation_mv", 0),
+            first_limit_time=stock.get("first_limit_time", ""),
+            theme_purity=purity,
+            historical_activity=activity,
+            hot_money_boost=hot_money_boost,
+        )
+        scored_stocks.append({
+            **stock,
+            "seal_info": seal_info,
+            "data_sources": _merge_field_data_sources(
+                seal_info.get("data_sources"),
+                stock.get("data_sources"),
+            ),
+            "volume_score": volume_score,
+            "theme_heat": max_theme_heat,
+            "best_theme": best_theme,
+            "theme_purity": purity,
+            "historical_activity": activity,
+            "second_board_score": second_board_score,
+            "hot_money_boost": hot_money_boost,
+            "hot_money_seats": lhb_metrics.get("hot_money_seats", []),
+        })
+
+    return scored_stocks, market_emotion, emotion_metrics
+
+
+def scan_first_board_candidates(
+    trade_date: str = "",
+    min_score: int = 60,
+) -> list[dict]:
+    """扫描首板候选（按二板预期分排序），供 CLI/Web 扫描模式使用。"""
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    scored_stocks, _, _ = _build_scored_first_board_stocks(trade_date)
+    filtered = [s for s in scored_stocks if s.get("second_board_score", 0) >= min_score]
+    filtered.sort(key=lambda x: x["second_board_score"], reverse=True)
+    return filtered
 
 
 def _format_first_board_screen(
@@ -3939,19 +4860,233 @@ def _format_first_board_screen(
     lines.append("## 全部首板")
     for i, s in enumerate(scored_stocks[:20]):  # 最多显示20只
         seal = s["seal_info"]
+        ds = s.get("data_sources", {})
+        seal_tag = _source_suffix(ds, "seal_ratio")
+        time_tag = _source_suffix(ds, "first_limit_time")
+        ft = s.get("first_limit_time", "")
+        time_part = f"首封:{ft}{time_tag} " if ft else ""
         lines.append(
             f"  {i+1}. {s['code']} {s.get('name', '')} "
             f"{s.get('limit_type', '')} "
+            f"{time_part}"
             f"题材:{s.get('best_theme', '无')} "
-            f"封单:{seal['seal_strength_score']:.0f} "
+            f"封单比:{seal.get('seal_ratio', 0):.2f}%{seal_tag} "
             f"量价:{s['volume_score']:.0f} "
             f"评分:{s['second_board_score']}"
+            + (
+                f" [游资+{int(s['hot_money_boost'])}:{','.join(s.get('hot_money_seats', []))}]"
+                if s.get("hot_money_boost")
+                else ""
+            )
         )
 
     if total > 20:
         lines.append(f"  ... 共{total}只，仅显示前20只")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# P3-01: 竞价强度（历史日代理指标）
+# ---------------------------------------------------------------------------
+
+REGULATORY_ALERT_KEYWORDS = (
+    "异常波动",
+    "严重异常波动",
+    "股票交易异常",
+    "重点监控",
+    "问询函",
+    "监管函",
+    "风险提示",
+)
+
+
+def _parse_time_to_minutes(time_str: str) -> int | None:
+    if not time_str or ":" not in time_str:
+        return None
+    parts = time_str.split(":")
+    try:
+        return int(parts[0]) * 60 + int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _calculate_auction_strength_metrics(
+    code: str,
+    trade_date: str,
+    pool_stock: dict | None = None,
+) -> dict:
+    """竞价强度 0-100。无逐笔竞价时用开盘缺口 + 封板时刻代理 [估算]。"""
+    code = _normalize_ticker(code)
+    score = 50.0
+    factors: list[str] = []
+    open_gap_pct = 0.0
+    data_confidence = "[估算]"
+
+    if pool_stock is None:
+        for stock in _get_limitup_stocks(trade_date):
+            if stock.get("code") == code:
+                pool_stock = stock
+                break
+
+    if pool_stock:
+        if pool_stock.get("first_limit_time_confirmed"):
+            data_confidence = "[确认]"
+        fbt = pool_stock.get("first_limit_time", "")
+        minutes = _parse_time_to_minutes(fbt)
+        if minutes is not None:
+            if minutes <= 9 * 60 + 35:
+                score += 25
+                factors.append("早盘封板")
+            elif minutes <= 10 * 60 + 30:
+                score += 15
+                factors.append("上午封板")
+            elif minutes <= 11 * 60:
+                score += 5
+            else:
+                score -= 10
+                factors.append("午后封板")
+        if pool_stock.get("limit_type") == "一字":
+            score += 20
+            factors.append("一字板")
+        open_times = int(pool_stock.get("open_times", 0) or 0)
+        if open_times == 0:
+            score += 10
+        else:
+            score -= min(20, open_times * 5)
+            factors.append(f"开板{open_times}次")
+        seal_info = _get_stock_seal_info(pool_stock)
+        score += min(15.0, float(seal_info.get("seal_strength_score", 0)) / 10.0)
+        change_pct = float(pool_stock.get("change_pct", 0) or 0)
+        if change_pct >= 9.5:
+            score += 5
+            open_gap_pct = change_pct
+    else:
+        df = _load_ohlcv_astock(code, trade_date)
+        if df is not None and len(df) >= 2:
+            prev_close = float(df.iloc[-2]["Close"])
+            open_price = float(df.iloc[-1]["Open"])
+            if prev_close > 0:
+                open_gap_pct = (open_price / prev_close - 1) * 100
+                if open_gap_pct >= 9.5:
+                    score += 25
+                    factors.append("高开近涨停")
+                elif open_gap_pct >= 5:
+                    score += 15
+                    factors.append("强势高开")
+                elif open_gap_pct >= 2:
+                    score += 5
+                elif open_gap_pct < -2:
+                    score -= 15
+                    factors.append("低开")
+        factors.append("非涨停池代理")
+
+    score = max(0.0, min(100.0, score))
+    level = "强" if score >= 70 else "中" if score >= 50 else "弱"
+    return {
+        "auction_strength_score": int(round(score)),
+        "auction_strength_level": level,
+        "open_gap_pct": round(open_gap_pct, 2),
+        "factors": factors,
+        "data_confidence": data_confidence,
+    }
+
+
+def get_auction_strength(
+    ticker: Annotated[str, "6-digit A-share code or Chinese name"] = "",
+    trade_date: Annotated[str, "YYYY-MM-DD, default today"] = "",
+) -> str:
+    """个股竞价强度评估（0-100）。
+
+    历史交易日无免费逐笔竞价源时，使用开盘缺口 + 首封时间代理 [估算]。
+    涨停池内且东财 fbt 有值时标 [确认]。
+    """
+    code = _normalize_ticker(ticker)
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+
+    metrics = _calculate_auction_strength_metrics(code, trade_date)
+    factors = metrics.get("factors") or []
+    factor_text = "、".join(factors) if factors else "无"
+    return "\n".join([
+        f"# 竞价强度 | {code} | {trade_date}",
+        f"# Source: 东财涨停池 + K线开盘缺口",
+        f"# Retrieved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"**竞价强度**: {metrics['auction_strength_score']} ({metrics['auction_strength_level']})",
+        f"**开盘缺口**: {metrics['open_gap_pct']:.2f}%",
+        f"**因子**: {factor_text}",
+        f"**置信度**: {metrics['data_confidence']}",
+    ])
+
+
+def _fetch_cninfo_announcements_list(code: str, page_size: int = 30) -> list[dict]:
+    """拉取巨潮公告列表（内部复用）。"""
+    try:
+        org_id = _cninfo_orgid(code)
+        url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+        payload = {
+            "stock": f"{code},{org_id}",
+            "tabName": "fulltext",
+            "pageSize": str(page_size),
+            "pageNum": "1",
+            "column": "",
+            "category": "",
+            "plate": "",
+            "seDate": "",
+            "searchkey": "",
+            "secid": "",
+            "sortName": "",
+            "sortType": "",
+            "isHLtitle": "true",
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": "https://www.cninfo.com.cn/new/disclosure",
+            "Origin": "https://www.cninfo.com.cn",
+        }
+        r = _direct_post(url, data=payload, headers=headers, timeout=15)
+        return r.json().get("announcements") or []
+    except Exception as e:
+        logger.warning("_fetch_cninfo_announcements_list failed for %s: %s", code, e)
+        return []
+
+
+def _get_regulatory_alert_metrics(
+    code: str,
+    trade_date: str,
+    lookback_days: int = 30,
+) -> dict:
+    """监管异动检测：近 N 日巨潮公告标题关键词匹配。"""
+    code = _normalize_ticker(code)
+    if not trade_date:
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+    end_dt = datetime.strptime(trade_date, "%Y-%m-%d")
+    start_dt = end_dt - timedelta(days=lookback_days)
+    alerts: list[dict] = []
+    for ann in _fetch_cninfo_announcements_list(code, page_size=40):
+        date_str = _cninfo_ts_to_date(ann.get("announcementTime"))
+        if not date_str:
+            continue
+        try:
+            ann_dt = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if ann_dt < start_dt or ann_dt > end_dt:
+            continue
+        title = (ann.get("announcementTitle", "") or "").replace("<em>", "").replace("</em>", "")
+        if any(kw in title for kw in REGULATORY_ALERT_KEYWORDS):
+            alerts.append({
+                "date": date_str,
+                "title": title[:100],
+            })
+    return {
+        "has_regulatory_alert": bool(alerts),
+        "alert_count": len(alerts),
+        "recent_alerts": alerts[:5],
+        "source": "cninfo",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4147,7 +5282,7 @@ def _get_northbound_flow_signal(trade_date: str) -> dict:
             "Host": "data.hexin.cn",
             "Referer": "https://data.hexin.cn/",
         }
-        r = _requests.get(url, headers=headers, timeout=10)
+        r = _direct_get(url, headers=headers, timeout=10)
         d = r.json()
 
         times = d.get("time", [])
@@ -4183,10 +5318,7 @@ def _get_northbound_flow_signal(trade_date: str) -> dict:
 # ===========================================================================
 
 def _get_previous_trading_date(trade_date: str) -> str:
-    """获取上一个交易日日期（简单回退，跳过周末）。
-
-    注意: 不处理节假日，仅跳过周末。非精确交易日历。
-    """
+    """获取上一个交易日（跳过周末与简易节假日表）。"""
     from datetime import timedelta
 
     try:
@@ -4195,10 +5327,105 @@ def _get_previous_trading_date(trade_date: str) -> str:
         dt = datetime.now()
 
     dt = dt - timedelta(days=1)
-    # 跳过周末
-    while dt.weekday() >= 5:  # 5=Saturday, 6=Sunday
+    while not _is_trading_day(dt.strftime("%Y-%m-%d")):
         dt = dt - timedelta(days=1)
     return dt.strftime("%Y-%m-%d")
+
+
+_TRADING_HOLIDAYS: set[str] | None = None
+
+
+def _trading_holidays_path():
+    from pathlib import Path
+
+    return Path(__file__).resolve().parent.parent.parent / "data" / "a_share_trading_holidays.json"
+
+
+def _load_trading_holidays() -> set[str]:
+    """加载 A 股休市日集合（进程内缓存）。"""
+    global _TRADING_HOLIDAYS
+    if _TRADING_HOLIDAYS is not None:
+        return _TRADING_HOLIDAYS
+
+    path = _trading_holidays_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = _json.load(f)
+        _TRADING_HOLIDAYS = set(payload.get("holidays", []))
+    except (OSError, _json.JSONDecodeError, TypeError):
+        logger.warning("a_share_trading_holidays.json unavailable: %s", path)
+        _TRADING_HOLIDAYS = set()
+    return _TRADING_HOLIDAYS
+
+
+def _is_trading_day(date_str: str) -> bool:
+    """判断是否为交易日（非周末且不在节假日表）。"""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return False
+    if dt.weekday() >= 5:
+        return False
+    return date_str not in _load_trading_holidays()
+
+
+def _get_recent_emotion_history(trade_date: str, days: int = 3) -> list[dict]:
+    """获取近 N 个交易日情绪快照（不含 trade_date 当日），按时间倒序 [T-1, T-2, ...]。
+
+    供多日情绪状态机使用：冰点确认、退潮确认、修复可操作判定等。
+    """
+    snapshots: list[dict] = []
+    current = trade_date
+    for _ in range(max(1, days)):
+        current = _get_previous_trading_date(current)
+        limitup = _get_limitup_stocks(current)
+        yesterday_raw = _get_yesterday_limitup_performance(current)
+        yesterday_perf = _calculate_yesterday_performance(yesterday_raw)
+        board_dist = _get_board_distribution(limitup)
+        northbound = _get_northbound_flow_signal(current)
+
+        prev_date = _get_previous_trading_date(current)
+        prev_highest = _get_board_distribution(_get_limitup_stocks(prev_date)).get(
+            "highest_board", 0
+        )
+        current_highest = board_dist.get("highest_board", 0)
+        dist = board_dist.get("distribution", {})
+
+        promo = yesterday_perf.get("promotion_rates", {})
+        avg_promo = sum(promo.values()) / len(promo) if promo else 100
+
+        snapshots.append({
+            "date": current,
+            "highest_board": current_highest,
+            "total_limitup": board_dist.get("total", 0),
+            "first_board_count": dist.get(1, 0),
+            "highest_board_dropped": current_highest < prev_highest,
+            "heavy_muffled_rate": yesterday_perf.get("heavy_muffled_rate", 0),
+            "muffled_rate": yesterday_perf.get("muffled_rate", 0),
+            "avg_return": yesterday_perf.get("avg_return", 0),
+            "avg_promotion_rate": avg_promo,
+            "northbound_direction": northbound.get("direction", "无数据"),
+        })
+    return snapshots
+
+
+def _build_recent_2day_emotion_data(trade_date: str) -> list[dict]:
+    """构建近 2 个交易日快照，供冰点确认机制使用。"""
+    return _get_recent_emotion_history(trade_date, days=2)
+
+
+def _count_historical_broken_board(
+    code: str, trade_date: str, lookback_days: int = 20
+) -> int:
+    """统计近 N 个交易日炸板次数（出现在炸板池的天数）。"""
+    count = 0
+    current = trade_date
+    for _ in range(lookback_days):
+        current = _get_previous_trading_date(current)
+        broken = _get_broken_board_stocks_em(current)
+        if any(s.get("code") == code for s in broken):
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -4313,39 +5540,67 @@ def _get_board_distribution(limitup_stocks: list[dict]) -> dict:
 # P2-03: 封板质量评估
 # ---------------------------------------------------------------------------
 
-def _calculate_seal_quality(limitup_stocks: list[dict]) -> dict:
+def _calculate_seal_quality(
+    limitup_stocks: list[dict],
+    broken_stocks: list[dict] | None = None,
+) -> dict:
     """封板质量综合评估（拆分一字板/换手板）。
+
+    参数:
+        limitup_stocks: 当日涨停列表
+        broken_stocks: 东财炸板池列表；None 表示未接入炸板数据
 
     返回:
         {
-            "yizi_count": int,            # 一字板数量
-            "huan_shou_count": int,       # 换手板数量
-            "total_limitup": int,         # 涨停总数
-            "effective_seal_rate": float, # 有效封板率（换手板中早盘封板占比）
-            "seal_success_rate": float,   # 封板成功率
-            "seal_strength_median": float,# 封单强度中位数
+            "yizi_count": int,
+            "huan_shou_count": int,
+            "total_limitup": int,
+            "broken_board_count": int,
+            "broken_board_rate": float,
+            "effective_seal_rate": float,
+            "seal_success_rate": float,
+            "seal_strength_median": float,
+            "data_sources": dict,
         }
-
-    数据限制:
-    - 缺少封单金额/峰值数据，封板成功率简化为 换手板数/总数
-    - 缺少分时数据，无法精确计算早盘封板时间
     """
+    empty = {
+        "yizi_count": 0, "huan_shou_count": 0, "total_limitup": 0,
+        "broken_board_count": 0, "broken_board_rate": 0.0,
+        "effective_seal_rate": 0, "seal_success_rate": 0,
+        "seal_strength_median": 0,
+        "data_sources": {},
+    }
     if not limitup_stocks:
-        return {
-            "yizi_count": 0, "huan_shou_count": 0, "total_limitup": 0,
-            "effective_seal_rate": 0, "seal_success_rate": 0,
-            "seal_strength_median": 0,
-        }
+        if broken_stocks is not None:
+            broken_count = len(broken_stocks)
+            empty["broken_board_count"] = broken_count
+            empty["broken_board_rate"] = 100.0 if broken_count else 0.0
+            empty["seal_success_rate"] = 0.0
+            empty["data_sources"] = {
+                "seal_success_rate": "[确认]",
+                "broken_board_rate": "[确认]",
+            }
+        return empty
 
     yizi = sum(1 for s in limitup_stocks if s.get("limit_type") == "一字")
     huanshou = sum(1 for s in limitup_stocks if s.get("limit_type") == "换手")
     total = len(limitup_stocks)
 
-    # 有效封板率: 换手板占比（简化版，缺少分时数据无法精确计算早盘封板）
+    # 有效封板率: 换手板占比（缺少分时数据无法精确计算早盘封板）
     effective_seal_rate = round(huanshou / max(total, 1) * 100, 1)
 
-    # 封板成功率: 换手板数/总数（简化版，缺少炸板数据）
-    seal_success_rate = round(huanshou / max(total, 1) * 100, 1)
+    data_sources: dict[str, str] = {}
+    broken_count = len(broken_stocks) if broken_stocks is not None else 0
+    if broken_stocks is not None:
+        attempts = total + broken_count
+        seal_success_rate = round(total / max(attempts, 1) * 100, 1)
+        broken_board_rate = round(broken_count / max(attempts, 1) * 100, 1)
+        data_sources["seal_success_rate"] = "[确认]"
+        data_sources["broken_board_rate"] = "[确认]"
+    else:
+        seal_success_rate = round(huanshou / max(total, 1) * 100, 1)
+        broken_board_rate = 0.0
+        data_sources["seal_success_rate"] = "[估算]"
 
     # 封单强度中位数: 使用换手率作为代理指标（缺少封单金额数据）
     turnover_rates = [
@@ -4362,9 +5617,12 @@ def _calculate_seal_quality(limitup_stocks: list[dict]) -> dict:
         "yizi_count": yizi,
         "huan_shou_count": huanshou,
         "total_limitup": total,
+        "broken_board_count": broken_count,
+        "broken_board_rate": broken_board_rate,
         "effective_seal_rate": effective_seal_rate,
         "seal_success_rate": seal_success_rate,
         "seal_strength_median": round(seal_strength_median, 2),
+        "data_sources": data_sources,
     }
 
 
@@ -4515,6 +5773,97 @@ def _calculate_board_health(board_dist: dict) -> float:
 # P2-06: 情绪周期判断
 # ---------------------------------------------------------------------------
 
+def _count_ice_point_confirm_days(history: list[dict] | None) -> int:
+    """统计历史中满足冰点确认条件的连续日数（含当日由调用方追加）。"""
+    if not history:
+        return 0
+    confirm_count = 0
+    for day_data in history:
+        conditions_met = 0
+        if day_data.get("highest_board_dropped"):
+            conditions_met += 1
+        if day_data.get("heavy_muffled_rate", 0) > 25:
+            conditions_met += 1
+        if day_data.get("avg_promotion_rate", 100) < 20:
+            conditions_met += 1
+        if day_data.get("northbound_direction") in ("小幅流出", "大幅流出"):
+            conditions_met += 1
+        if conditions_met >= 2:
+            confirm_count += 1
+    return confirm_count
+
+
+def _is_ice_point_spec_consecutive(
+    history: list[dict] | None,
+    highest: int,
+    total: int,
+    heavy_muffled: float,
+) -> bool:
+    """P1 冰点确认：连续 2 日最高板≤2 且闷杀率>30% 且涨停<15。"""
+    streak = 0
+    check_days: list[dict] = list(history or [])
+    check_days.insert(0, {
+        "highest_board": highest,
+        "total_limitup": total,
+        "heavy_muffled_rate": heavy_muffled,
+    })
+    for day in check_days[:2]:
+        if (
+            day.get("highest_board", 0) <= 2
+            and day.get("heavy_muffled_rate", 0) > 30
+            and day.get("total_limitup", 0) < 15
+        ):
+            streak += 1
+        else:
+            streak = 0
+        if streak >= 2:
+            return True
+    return False
+
+
+def _is_retreat_confirmed(
+    history: list[dict] | None,
+    highest_dropped: bool,
+    avg_promotion: float,
+) -> bool:
+    """P1 退潮确认：前日高潮/升温 + 今日最高板断板 + 晋级率<30%。"""
+    if not history or not highest_dropped or avg_promotion >= 30:
+        return False
+    prev = history[0]
+    prev_hot = (
+        prev.get("highest_board", 0) >= 5
+        or (
+            prev.get("highest_board", 0) >= 3
+            and prev.get("avg_return", 0) > 0
+        )
+    )
+    return prev_hot
+
+
+def _is_repair_actionable(
+    history: list[dict] | None,
+    first_board_count: int,
+    avg_return: float,
+    heavy_muffled: float,
+) -> bool:
+    """P1 修复可操作：冰点/退潮后首板回升 + 均收益>0 + 核按钮占比<20%。"""
+    if not history or avg_return <= 0 or heavy_muffled >= 20:
+        return False
+    prev = history[0]
+    came_from_cold = (
+        (
+            prev.get("highest_board", 0) <= 2
+            and prev.get("heavy_muffled_rate", 0) > 25
+        )
+        or (
+            prev.get("highest_board_dropped")
+            and prev.get("avg_promotion_rate", 100) < 30
+        )
+    )
+    first_board_rising = first_board_count > prev.get("first_board_count", 0)
+    return came_from_cold and first_board_rising
+
+
 def _judge_emotion_phase(
     seal_quality: dict,
     yesterday_performance: dict,
@@ -4522,8 +5871,9 @@ def _judge_emotion_phase(
     market_breadth: dict,
     northbound_signal: dict,
     recent_2day_data: list[dict] | None = None,
+    recent_emotion_history: list[dict] | None = None,
 ) -> str:
-    """情绪周期判断（含冰点确认机制）。
+    """情绪周期判断（P1 多日状态机）。
 
     核心逻辑:
     1. 高标股状态是第一判断依据
@@ -4532,71 +5882,69 @@ def _judge_emotion_phase(
     4. 北向资金方向
     5. 市场宽度（涨跌家数比）
 
-    冰点确认机制:
-    - 单日冰点信号: 高标断板 + 梯队崩塌 + 重度闷杀率>30%
-    - 确认冰点: 需要连续2天满足以下任意2条
-      * 高标断板或降级
-      * 闷杀率>25%
-      * 晋级率<20%
-      * 北向资金连续流出
+    P1 扩展阶段:
+    - 冰点（已确认）: 连续 2 日满足 spec 或历史确认机制
+    - 退潮（确认）: 前日高潮/升温 + 最高板断板 + 晋级率<30%
+    - 修复（可操作）: 冰点/退潮后首板回升 + 均收益>0 + 核按钮<20%
+    - 高潮（减仓）: 在 _calculate_emotion_metrics 中按情绪分二次标注
 
-    返回: "冰点" | "冰点（已确认）" | "低迷" | "修复" | "升温" | "高潮" | "退潮"
+    返回: 冰点 | 冰点（已确认） | 退潮 | 退潮（确认） | 修复 | 修复（可操作）
+          | 升温 | 高潮 | 低迷
     """
+    history = recent_emotion_history or recent_2day_data
+
     highest = board_dist.get("highest_board", 0)
     total = board_dist.get("total", 0)
     dist = board_dist.get("distribution", {})
+    first_board_count = dist.get(1, 0)
     avg_return = yesterday_performance.get("avg_return", 0)
     heavy_muffled = yesterday_performance.get("heavy_muffled_rate", 0)
     muffled = yesterday_performance.get("muffled_rate", 0)
-    continuous_premium = yesterday_performance.get("continuous_premium", 0)
     promotion_rates = yesterday_performance.get("promotion_rates", {})
     ad_ratio = market_breadth.get("ad_ratio", 1)
-    northbound_dir = northbound_signal.get("direction", "无数据")
 
-    # 冰点确认机制
-    if recent_2day_data and len(recent_2day_data) >= 2:
-        confirm_count = 0
-        for day_data in recent_2day_data:
-            conditions_met = 0
-            if day_data.get("highest_board_dropped"):
-                conditions_met += 1
-            if day_data.get("heavy_muffled_rate", 0) > 25:
-                conditions_met += 1
-            avg_promo = day_data.get("avg_promotion_rate", 100)
-            if avg_promo < 20:
-                conditions_met += 1
-            if day_data.get("northbound_direction") in ("小幅流出", "大幅流出"):
-                conditions_met += 1
-            if conditions_met >= 2:
-                confirm_count += 1
-
-        if confirm_count >= 2:
-            return "冰点（已确认）"
-
-    # 单日判断
-    # 冰点: 高标断板 + 梯队崩塌 + 重度闷杀率高
-    if highest <= 2 and heavy_muffled > 30 and total < 15:
-        return "冰点"
-
-    # 退潮: 高标开始分歧 + 低位晋级率下降
     avg_promotion = (
         sum(promotion_rates.values()) / len(promotion_rates)
         if promotion_rates else 0
     )
+
+    prev_highest = history[0].get("highest_board", highest) if history else highest
+    highest_dropped = highest < prev_highest
+
+    # 冰点（已确认）
+    if history and len(history) >= 2 and _count_ice_point_confirm_days(history) >= 2:
+        return "冰点（已确认）"
+    if _is_ice_point_spec_consecutive(history, highest, total, heavy_muffled):
+        return "冰点（已确认）"
+
+    # 单日冰点
+    if highest <= 2 and heavy_muffled > 30 and total < 15:
+        return "冰点"
+
+    # 退潮（确认）
+    if _is_retreat_confirmed(history, highest_dropped, avg_promotion):
+        return "退潮（确认）"
+
+    # 单日退潮
     if highest >= 3 and heavy_muffled > 20 and avg_promotion < 30:
         return "退潮"
 
-    # 高潮: 高标持续封板 + 梯队完整 + 赚钱效应强
     board_health = _calculate_board_health(board_dist)
+
+    # 高潮（减仓标签在 _calculate_emotion_metrics 中按 emotion_score 追加）
     if (highest >= 5 and board_health > 70 and avg_return > 2
             and heavy_muffled < 10 and ad_ratio > 2):
         return "高潮"
 
-    # 升温: 连板梯队恢复 + 赚钱效应回升
+    # 修复（可操作）
+    if _is_repair_actionable(history, first_board_count, avg_return, heavy_muffled):
+        return "修复（可操作）"
+
+    # 升温
     if highest >= 3 and board_health > 50 and avg_return > 0 and muffled < 20:
         return "升温"
 
-    # 修复: 高标断板后有新龙接力 + 闷杀率下降
+    # 修复
     if highest >= 2 and avg_return > -1 and muffled < 25:
         return "修复"
 
@@ -4618,6 +5966,8 @@ def _calculate_emotion_metrics(
     market_breadth: dict,
     northbound_signal: dict,
     recent_2day_data: list[dict] | None = None,
+    recent_emotion_history: list[dict] | None = None,
+    trade_date: str = "",
 ) -> dict:
     """计算情绪量化指标汇总。
 
@@ -4627,7 +5977,9 @@ def _calculate_emotion_metrics(
         yesterday_performance: 昨日涨停表现（_calculate_yesterday_performance 返回值）
         market_breadth: 市场涨跌家数（_get_market_breadth 返回值）
         northbound_signal: 北向资金信号（_get_northbound_flow_signal 返回值）
-        recent_2day_data: 近2天数据（冰点确认用）
+        recent_2day_data: 近2天数据（冰点确认用，兼容旧调用）
+        recent_emotion_history: 近 N 天情绪快照（P1 状态机，默认由 trade_date 构建）
+        trade_date: 交易日，用于炸板池与情绪历史
 
     返回:
         {
@@ -4647,12 +5999,21 @@ def _calculate_emotion_metrics(
         }
     """
     board_dist = _get_board_distribution(limitup_stocks)
-    seal_quality = _calculate_seal_quality(limitup_stocks)
+    broken_stocks = _get_broken_board_stocks_em(trade_date) if trade_date else None
+    seal_quality = _calculate_seal_quality(limitup_stocks, broken_stocks)
     board_health = _calculate_board_health(board_dist)
+
+    history = recent_emotion_history
+    if history is None and trade_date:
+        history = _get_recent_emotion_history(trade_date, days=3)
+    elif history is None:
+        history = recent_2day_data
 
     emotion_phase = _judge_emotion_phase(
         seal_quality, yesterday_performance, board_dist,
-        market_breadth, northbound_signal, recent_2day_data,
+        market_breadth, northbound_signal,
+        recent_2day_data=recent_2day_data,
+        recent_emotion_history=history,
     )
 
     # 情绪综合评分 (0-100)
@@ -4660,6 +6021,14 @@ def _calculate_emotion_metrics(
         board_dist, seal_quality, yesterday_performance,
         board_health, market_breadth, northbound_signal,
     )
+
+    # P1: 高潮（减仓）二次标注 — 最高板≥5 且情绪分>70 且涨停>50
+    if (
+        emotion_phase == "高潮"
+        and emotion_score > 70
+        and len(limitup_stocks) > 50
+    ):
+        emotion_phase = "高潮（减仓）"
 
     return {
         "highest_board": board_dist["highest_board"],
@@ -4701,7 +6070,10 @@ def _compute_emotion_score(
     score += board_health * 0.25
 
     # 2. 封板质量 (20分)
-    seal_rate = seal_quality.get("effective_seal_rate", 0)
+    if seal_quality.get("data_sources", {}).get("seal_success_rate") == "[确认]":
+        seal_rate = seal_quality.get("seal_success_rate", 0)
+    else:
+        seal_rate = seal_quality.get("effective_seal_rate", 0)
     score += min(seal_rate / 100, 1.0) * 20
 
     # 3. 赚钱效应 (25分)
@@ -4768,9 +6140,12 @@ def get_consecutive_limit_stats(
         northbound_signal = _get_northbound_flow_signal(trade_date)
 
         # 4. 汇总情绪指标
+        recent_2day = _build_recent_2day_emotion_data(trade_date)
         metrics = _calculate_emotion_metrics(
             limitup_stocks, limitdown_stocks, yesterday_perf,
             market_breadth, northbound_signal,
+            recent_2day_data=recent_2day,
+            trade_date=trade_date,
         )
 
         # 5. 格式化输出
@@ -4799,6 +6174,10 @@ def _format_consecutive_limit_stats(
     lines.append(f"  情绪评分: {metrics['emotion_score']}/100")
     lines.append(f"  最高连板: {metrics['highest_board']}板")
     lines.append(f"  涨停家数: {metrics['limitup_count']} | 跌停家数: {metrics['limitdown_count']}")
+    sq_overview = metrics.get("seal_quality", {})
+    broken_count = sq_overview.get("broken_board_count", 0)
+    if sq_overview.get("data_sources", {}).get("broken_board_rate") == "[确认]":
+        lines.append(f"  炸板家数: {broken_count}")
     lines.append(f"  一字板: {metrics['yizi_count']} | 换手板: {metrics['huan_shou_count']}")
     lines.append("")
 
@@ -4814,9 +6193,16 @@ def _format_consecutive_limit_stats(
 
     # 封板质量
     sq = metrics.get("seal_quality", {})
+    sq_sources = sq.get("data_sources", {})
     lines.append("## 封板质量")
+    if sq_sources.get("broken_board_rate") == "[确认]":
+        tag = sq_sources["broken_board_rate"]
+        lines.append(f"  炸板家数: {sq.get('broken_board_count', 0)} {tag}")
+        lines.append(f"  炸板率: {sq.get('broken_board_rate', 0)}% {tag}")
+    seal_tag = sq_sources.get("seal_success_rate", "")
+    seal_suffix = f" {seal_tag}" if seal_tag else ""
     lines.append(f"  有效封板率: {sq.get('effective_seal_rate', 0)}%")
-    lines.append(f"  封板成功率: {sq.get('seal_success_rate', 0)}%")
+    lines.append(f"  封板成功率: {sq.get('seal_success_rate', 0)}%{seal_suffix}")
     lines.append(f"  封单强度中位数: {sq.get('seal_strength_median', 0)}")
     lines.append("")
 
@@ -4883,7 +6269,7 @@ def _cninfo_orgid(code: str) -> str:
     global _CNINFO_ORGID_MAP
     if not _CNINFO_ORGID_MAP:
         try:
-            r = _requests.get(
+            r = _direct_get(
                 "http://www.cninfo.com.cn/new/data/szse_stock.json",
                 headers={"User-Agent": _UA},
                 timeout=15,
@@ -4957,7 +6343,7 @@ def get_cninfo_announcements(
             "Referer": "https://www.cninfo.com.cn/new/disclosure",
             "Origin": "https://www.cninfo.com.cn",
         }
-        r = _requests.post(url, data=payload, headers=headers, timeout=15)
+        r = _direct_post(url, data=payload, headers=headers, timeout=15)
         d = r.json()
 
         announcements = d.get("announcements") or []
@@ -5080,28 +6466,29 @@ def _get_limitup_by_theme(trade_date: str) -> dict[str, list[dict]]:
 # P3-02: 题材历史热度
 # ---------------------------------------------------------------------------
 
-def _get_theme_history(theme_name: str, days: int = 7) -> list[dict]:
-    """获取某题材近N日涨停情况。
+def _get_theme_history(
+    theme_name: str,
+    days: int = 7,
+    trade_date: str = "",
+) -> list[dict]:
+    """获取某题材近 N 个交易日涨停情况（锚定 trade_date）。
 
     返回:
         [{"date": "2026-06-13", "count": 12, "highest_board": 5}, ...]
+        按时间倒序：[trade_date, T-1, T-2, ...]
 
     注意:
-    - 返回所有日期（包括count=0的日期），用于计算"活跃天数"
-    - 通过回溯N天的涨停数据并按归一化题材聚合
+    - 返回所有回溯交易日（包括 count=0 的日期），用于计算活跃天数
+    - 通过回溯涨停数据并按归一化题材聚合
     """
-    from datetime import timedelta
+    if not trade_date or trade_date.strip() == "":
+        trade_date = datetime.now().strftime("%Y-%m-%d")
 
     history: list[dict] = []
-    for i in range(days):
-        dt = datetime.now() - timedelta(days=i)
-        date_str = dt.strftime("%Y-%m-%d")
-        # 跳过周末
-        if dt.weekday() >= 5:
-            continue
-
+    current = trade_date
+    for _ in range(max(1, days)):
         try:
-            theme_map = _get_limitup_by_theme(date_str)
+            theme_map = _get_limitup_by_theme(current)
             theme_stocks = theme_map.get(theme_name, [])
             count = len(theme_stocks)
             highest_board = max((s.get("board_num", 0) for s in theme_stocks), default=0)
@@ -5110,10 +6497,11 @@ def _get_theme_history(theme_name: str, days: int = 7) -> list[dict]:
             highest_board = 0
 
         history.append({
-            "date": date_str,
+            "date": current,
             "count": count,
             "highest_board": highest_board,
         })
+        current = _get_previous_trading_date(current)
 
     return history
 
@@ -5502,7 +6890,7 @@ def get_theme_heat(
             leader_status = _get_theme_leader_status(theme_name, theme_stocks)
 
             # 历史热度（近7天）
-            theme_history = _get_theme_history(theme_name, days=7)
+            theme_history = _get_theme_history(theme_name, days=7, trade_date=trade_date)
 
             # 活跃天数
             active_days = _get_theme_active_days(theme_history)
@@ -5703,7 +7091,7 @@ def _get_high_board_detail(
             "seal_status": "封板",
         }
 
-    数据源: 腾讯财经(行情) + K线(涨停/一字判断)
+    数据源: 东财 push2ex open_times + 腾讯财经(行情) + K线(一字判断)
     """
     code = stock["code"]
     board_num = stock.get("consecutive_days", 0)
@@ -5727,23 +7115,17 @@ def _get_high_board_detail(
     else:
         seal_status = "封板"
 
-    # 封单/流通盘比
     circulation_mv = stock.get("circulation_mv", 0)
     amount = stock.get("amount", 0)
-    seal_ratio = 0.0
-    if circulation_mv > 0:
-        seal_ratio = round(amount / circulation_mv * 100, 2)
+    seal_ratio = seal_info.get("seal_ratio", 0.0)
 
-    # 开板次数估算（基于换手率和封板类型）
-    open_count = 0
-    if not is_yizi and seal_status != "封板":
-        turnover = stock.get("turnover_rate", 0)
-        if turnover > 0.15:
-            open_count = 3
-        elif turnover > 0.10:
-            open_count = 2
-        elif turnover > 0.05:
-            open_count = 1
+    if stock.get("open_times_confirmed"):
+        open_count = int(stock.get("open_times", 0))
+    else:
+        open_count = 0
+
+    data_sources = dict(seal_info.get("data_sources") or {})
+    data_sources["open_count"] = "[确认]" if stock.get("open_times_confirmed") else "[估算]"
 
     # 找出最高热度题材
     raw_reason = stock.get("reason", "")
@@ -5773,6 +7155,7 @@ def _get_high_board_detail(
         "seal_strength_score": seal_info.get("seal_strength_score", 50),
         "change_pct": change_pct,
         "price": quote.get("price", 0),
+        "data_sources": data_sources,
     }
 
 
@@ -5892,6 +7275,7 @@ def _calculate_break_risk_level(
     consecutive_yizi_days: int,
     yizi_cumulative_turnover: float,
     card_position_exists: bool,
+    institutional_net_wan: float = 0,
 ) -> dict:
     """断板风险评估（细化版，含一字板累计换手率）。
 
@@ -5945,8 +7329,14 @@ def _calculate_break_risk_level(
     if card_position_exists:
         risk_signals.append("有卡位威胁")
 
+    # 信号7：龙虎榜机构净卖（P1）
+    if institutional_net_wan < -2000:
+        risk_signals.append("机构大幅净卖出")
+    elif institutional_net_wan < -500:
+        risk_signals.append("机构净卖出")
+
     # 判断风险等级
-    high_risk_keywords = ["放量一字后开板", "封板状态异常", "分歧度>70"]
+    high_risk_keywords = ["放量一字后开板", "封板状态异常", "分歧度>70", "机构大幅净卖出"]
     has_high_risk = any(
         kw in signal for kw in high_risk_keywords for signal in risk_signals
     )
@@ -6067,7 +7457,7 @@ def get_high_board_status(
         breadth = _get_market_breadth(trade_date)
         northbound = _get_northbound_flow_signal(trade_date)
         emotion_metrics = _calculate_emotion_metrics(
-            all_limitup, limitdown, {}, breadth, northbound
+            all_limitup, limitdown, {}, breadth, northbound, trade_date=trade_date
         )
         market_emotion = emotion_metrics.get("emotion_phase", "修复")
 
@@ -6110,6 +7500,10 @@ def get_high_board_status(
                 avg_board = sum(s.get("board_num", 1) for s in theme_stocks) / len(theme_stocks)
                 theme_perf = round(avg_board * 2 - 3, 2)  # 简化估算
 
+            # 龙虎榜机构动向（当日上榜）
+            lhb_metrics = _get_lhb_seat_metrics(code, trade_date)
+            inst_net_wan = float(lhb_metrics.get("institutional_net_wan", 0))
+
             # 断板风险评估
             break_risk = _calculate_break_risk_level(
                 board_num=detail["board_num"],
@@ -6121,6 +7515,7 @@ def get_high_board_status(
                 consecutive_yizi_days=detail["board_num"] if detail["is_yizi"] else 0,
                 yizi_cumulative_turnover=yizi_turnover,
                 card_position_exists=len(card_position_codes) > 0,
+                institutional_net_wan=inst_net_wan,
             )
 
             # 板块效应
@@ -6174,6 +7569,7 @@ def _format_high_board_status(
         div = report["divergence"]
         risk = report["break_risk"]
         te = report["theme_effect"]
+        ds = d.get("data_sources", {})
 
         lines.append(f"## #{i+1} {d['code']} {d['name']} ({d['board_num']}板)")
         lines.append(f"  封板状态: {d['seal_status']}")
@@ -6182,9 +7578,15 @@ def _format_high_board_status(
         lines.append(f"  流通市值: {d['circulation_mv'] / 1e8:.1f}亿" if d['circulation_mv'] else "  流通市值: N/A")
         lines.append(f"  换手率: {d['turnover_rate'] * 100:.2f}%" if d['turnover_rate'] else "  换手率: N/A")
         lines.append(f"  成交额: {d['amount'] / 1e8:.2f}亿" if d['amount'] else "  成交额: N/A")
-        lines.append(f"  封单/流通盘比: {d['seal_ratio']:.2f}%")
+        lines.append(
+            f"  封单/流通盘比: {d['seal_ratio']:.2f}%"
+            f"{_source_suffix(ds, 'seal_ratio')}"
+        )
         lines.append(f"  一字板: {'是' if d['is_yizi'] else '否'}")
-        lines.append(f"  开板次数: {d['open_count']}次")
+        lines.append(
+            f"  开板次数: {d['open_count']}次"
+            f"{_source_suffix(ds, 'open_count')}"
+        )
 
         # 分歧度
         lines.append(f"  --- 分歧度 ---")
@@ -6547,6 +7949,189 @@ def _identify_card_position(
     return results
 
 
+def _enrich_theme_stock_for_card(stock: dict, trade_date: str) -> dict:
+    """为题材涨停股补充 seal_strength / change_pct（卡位分析用）。"""
+    enriched = dict(stock)
+    if "seal_strength" not in enriched or not enriched.get("seal_strength"):
+        pool_match = _resolve_stock_in_pool_for_code(stock.get("code", ""), trade_date)
+        if pool_match:
+            seal_info = _get_stock_seal_info(pool_match)
+            ratio = float(seal_info.get("seal_ratio", 0) or 0)
+            enriched["seal_strength"] = ratio / 100.0 if ratio > 0 else 0.0
+            enriched["change_pct"] = float(pool_match.get("change_pct", 0) or 0)
+            enriched["first_limit_time"] = pool_match.get("first_limit_time", "")
+        else:
+            enriched["seal_strength"] = 0.0
+    if "board_num" not in enriched:
+        enriched["board_num"] = enriched.get("consecutive_days", 1)
+    return enriched
+
+
+def _resolve_stock_in_pool_for_code(code: str, trade_date: str) -> dict | None:
+    for stock in _get_limitup_stocks(trade_date):
+        if stock.get("code") == code:
+            return stock
+    return None
+
+
+def _get_same_theme_performance(
+    theme: str,
+    trade_date: str,
+    exclude_code: str = "",
+) -> float:
+    """同题材涨停股当日平均涨幅（%），不含 exclude_code。"""
+    if not theme:
+        return 0.0
+    cache_key = ("same_theme_perf", theme, trade_date, exclude_code)
+    if cache_key in _session_cache:
+        return float(_session_cache[cache_key])
+
+    theme_map = _get_limitup_by_theme(trade_date)
+    theme_stocks = theme_map.get(theme, [])
+    if len(theme_stocks) <= 1:
+        _session_cache[cache_key] = 0.0
+        return 0.0
+
+    pool_by_code = {s["code"]: s for s in _get_limitup_stocks(trade_date)}
+    pcts: list[float] = []
+    for item in theme_stocks:
+        code = item.get("code", "")
+        if code == exclude_code:
+            continue
+        full = pool_by_code.get(code, item)
+        pct = float(full.get("change_pct", 0) or 0)
+        if pct != 0:
+            pcts.append(pct)
+
+    result = sum(pcts) / len(pcts) if pcts else 0.0
+    _session_cache[cache_key] = result
+    return result
+
+
+def _get_card_position_metrics(
+    ticker: str,
+    trade_date: str,
+    theme: str = "",
+) -> dict:
+    """轻量卡位指标（供 TradingHardLogic 复用，不走 Markdown 工具路径）。"""
+    code = _normalize_ticker(ticker)
+    empty = {
+        "card_position_exists": False,
+        "card_position_success": False,
+        "card_position_codes": [],
+        "card_position_threat": "无",
+        "leader_code": None,
+        "data_confidence": "[估算]",
+    }
+    cache_key = ("card_position_metrics", code, trade_date, theme or "")
+    if cache_key in _session_cache:
+        cached = _session_cache[cache_key]
+        return cached if isinstance(cached, dict) else empty
+
+    pool_stock = _resolve_stock_in_pool_for_code(code, trade_date)
+    if not theme and pool_stock:
+        raw_reason = pool_stock.get("reason", "")
+        reasons = [
+            r.strip()
+            for r in raw_reason.replace("，", "+").split("+")
+            if r.strip()
+        ]
+        if reasons:
+            theme = _normalize_theme_name(reasons[0])
+
+    if not theme:
+        _session_cache[cache_key] = empty
+        return empty
+
+    theme_map = _get_limitup_by_theme(trade_date)
+    theme_stocks = theme_map.get(theme, [])
+    if not theme_stocks:
+        _session_cache[cache_key] = empty
+        return empty
+
+    enriched = [
+        _enrich_theme_stock_for_card(s, trade_date) for s in theme_stocks
+    ]
+    sealed = [
+        s for s in enriched
+        if s.get("limit_type") != "断板"
+    ]
+    if not sealed:
+        _session_cache[cache_key] = empty
+        return empty
+
+    max_board = max(s.get("board_num", 1) for s in sealed)
+    leaders = sorted(
+        [s for s in sealed if s.get("board_num", 1) == max_board],
+        key=lambda s: s.get("first_limit_time", "99:99"),
+    )
+    theme_leader = leaders[0]
+    leader_code = theme_leader["code"]
+    leader_board = int(theme_leader.get("board_num", 1))
+    leader_seal = float(theme_leader.get("seal_strength", 0) or 0)
+    leader_seal_status = "封板"
+
+    target_board = int(pool_stock.get("consecutive_days", 0) or 0) if pool_stock else 0
+    target_sealed = (
+        pool_stock is not None
+        and pool_stock.get("limit_type") != "断板"
+    )
+    target_broke = (
+        pool_stock is None
+        or pool_stock.get("limit_type") == "断板"
+        or (not target_sealed and target_board > 0)
+    )
+
+    eval_code = code if any(s["code"] == code for s in enriched) else leader_code
+    eval_board = target_board if code == eval_code and target_board else leader_board
+    eval_seal = float(
+        next((s.get("seal_strength", 0) for s in enriched if s["code"] == eval_code), 0)
+    ) or leader_seal
+    eval_seal_status = (
+        "封板"
+        if pool_stock and pool_stock.get("limit_type") != "断板" and code == eval_code
+        else "断板"
+        if target_broke and code == eval_code
+        else leader_seal_status
+    )
+
+    card_list = _identify_card_position(
+        leader_code=eval_code,
+        leader_board_num=eval_board,
+        leader_seal_strength=max(eval_seal, 0.01),
+        leader_seal_status=eval_seal_status,
+        same_theme_stocks=enriched,
+        market_emotion="修复",
+    )
+    card_codes = [c["code"] for c in card_list]
+    threat = "无"
+    if card_list:
+        priority = {"强卡位": 3, "中卡位": 2, "弱卡位": 1}
+        threat = max(card_list, key=lambda c: priority.get(c["card_type"], 0))["card_type"]
+
+    card_position_exists = len(card_list) > 0
+    card_position_success = False
+    if target_broke or (code == leader_code and eval_seal_status == "断板"):
+        successors = [
+            s for s in sealed
+            if s["code"] != code
+            and s.get("board_num", 1) >= max(1, eval_board - 1)
+        ]
+        strong_cards = [c for c in card_list if c["card_type"] in ("强卡位", "中卡位")]
+        card_position_success = bool(successors) or bool(strong_cards)
+
+    result = {
+        "card_position_exists": card_position_exists,
+        "card_position_success": card_position_success,
+        "card_position_codes": card_codes,
+        "card_position_threat": threat,
+        "leader_code": leader_code,
+        "data_confidence": "[确认]" if pool_stock else "[估算]",
+    }
+    _session_cache[cache_key] = result
+    return result
+
+
 def _identify_deputy_leader(
     leader_code: str,
     leader_board_num: int,
@@ -6862,14 +8447,43 @@ def get_leader_identification(
         all_limitup = _get_limitup_stocks(trade_date)
         theme_map = _get_limitup_by_theme(trade_date)
 
-        # 5. 目标股票的连板天数
-        target_kline = _detect_limitup_from_kline(code, trade_date)
-        target_board_num = target_kline.get("consecutive_days", 0)
+        # 5. 目标股票（优先涨停池字段）
+        pool_stock = next((s for s in all_limitup if s.get("code") == code), None)
+        target_board_num = (
+            pool_stock.get("consecutive_days", 0) if pool_stock
+            else _detect_limitup_from_kline(code, trade_date).get("consecutive_days", 0)
+        )
+        if not target_board_num and pool_stock is None:
+            target_kline = _detect_limitup_from_kline(code, trade_date)
+            target_board_num = 1 if target_kline.get("is_limit_up") else 0
 
         # 6. 封单信息
-        target_stock_dict = {"code": code, "consecutive_days": target_board_num}
+        target_stock_dict = pool_stock or {
+            "code": code,
+            "consecutive_days": target_board_num,
+            "limit_type": "换手",
+        }
         seal_info = _get_stock_seal_info(target_stock_dict)
         target_seal_strength = seal_info.get("seal_ratio", 0)
+        target_data_sources = _merge_field_data_sources(
+            seal_info.get("data_sources"),
+            pool_stock.get("data_sources") if pool_stock else None,
+        )
+        if pool_stock and pool_stock.get("first_limit_time_confirmed"):
+            target_data_sources["first_limit_time"] = "[确认]"
+        elif pool_stock and pool_stock.get("first_limit_time"):
+            target_data_sources["first_limit_time"] = "[估算]"
+
+        target_first_limit_time = (
+            pool_stock.get("first_limit_time", "")
+            if pool_stock
+            else _estimate_first_limit_time(code, trade_date, "换手")
+        )
+        if pool_stock and not target_first_limit_time:
+            target_first_limit_time = _estimate_first_limit_time(
+                code, trade_date, pool_stock.get("limit_type", "换手")
+            )
+            target_data_sources["first_limit_time"] = "[估算]"
 
         # 7. 判断目标股票的封板状态
         change_pct = quote.get("change_pct", 0)
@@ -6905,8 +8519,8 @@ def get_leader_identification(
             default="99:99",
         )
         is_earliest = (
-            target_kline.get("first_limit_time", "99:99") <= earliest_time
-            if same_board_stocks else False
+            target_first_limit_time <= earliest_time
+            if same_board_stocks and target_first_limit_time else False
         )
 
         # 题材内排名
@@ -6918,7 +8532,7 @@ def get_leader_identification(
 
         leader_score = _calculate_leader_score(
             board_num=target_board_num,
-            first_limit_time=target_kline.get("first_limit_time", ""),
+            first_limit_time=target_first_limit_time,
             seal_strength=target_seal_strength,
             theme_purity=theme_purity,
             theme_stocks_count=len(target_theme_stocks),
@@ -6927,8 +8541,22 @@ def get_leader_identification(
             is_market_highest=is_market_highest,
             is_earliest_in_board=is_earliest,
             is_yizi=target_kline.get("is_yizi", False),
-            historical_broken_count=0,  # 简化：暂无历史炸板数据
+            historical_broken_count=_count_historical_broken_board(code, trade_date),
         )
+
+        # 实时市场情绪（供卡位/补涨龙判断）
+        yesterday_raw = _get_yesterday_limitup_performance(trade_date)
+        yesterday_perf = _calculate_yesterday_performance(yesterday_raw)
+        emotion_metrics = _calculate_emotion_metrics(
+            all_limitup,
+            _get_limitdown_stocks(trade_date),
+            yesterday_perf,
+            _get_market_breadth(trade_date),
+            _get_northbound_flow_signal(trade_date),
+            recent_2day_data=_build_recent_2day_emotion_data(trade_date),
+            trade_date=trade_date,
+        )
+        market_emotion = emotion_metrics.get("emotion_phase", "修复")
 
         # 10. 卡位分析
         card_positions = _identify_card_position(
@@ -6937,7 +8565,7 @@ def get_leader_identification(
             leader_seal_strength=target_seal_strength,
             leader_seal_status=target_seal_status,
             same_theme_stocks=same_theme_stocks,
-            market_emotion="修复",  # 简化
+            market_emotion=market_emotion,
         )
 
         # 11. 补涨龙识别
@@ -6947,7 +8575,7 @@ def get_leader_identification(
             leader_seal_status=target_seal_status,
             leader_circulation_mv=quote.get("circulation_mv", 0),
             same_theme_stocks=same_theme_stocks,
-            market_emotion="修复",
+            market_emotion=market_emotion,
         )
 
         # 12. 补涨龙vs新龙头区分
@@ -6967,12 +8595,12 @@ def get_leader_identification(
 
         # 13. 强看好/强看空判断
         theme_active_days = _get_theme_active_days(
-            _get_theme_history(target_theme_name)
+            _get_theme_history(target_theme_name, trade_date=trade_date)
         ) if target_theme_name else 0
 
         strong_bullish = judge_strong_bullish_leader(
             board_num=target_board_num,
-            first_limit_time=target_kline.get("first_limit_time", ""),
+            first_limit_time=target_first_limit_time,
             seal_strength=target_seal_strength,
             theme_stock_count=len(target_theme_stocks),
             theme_active_days=theme_active_days,
@@ -6998,6 +8626,8 @@ def get_leader_identification(
             target_board_num=target_board_num,
             target_seal_status=target_seal_status,
             target_seal_strength=target_seal_strength,
+            target_first_limit_time=target_first_limit_time,
+            target_data_sources=target_data_sources,
             leader_score=leader_score,
             same_theme_stocks=same_theme_stocks,
             card_positions=card_positions,
@@ -7020,6 +8650,8 @@ def _format_leader_identification(
     target_board_num: int,
     target_seal_status: str,
     target_seal_strength: float,
+    target_first_limit_time: str,
+    target_data_sources: dict,
     leader_score: dict,
     same_theme_stocks: list[dict],
     card_positions: list[dict],
@@ -7044,7 +8676,15 @@ def _format_leader_identification(
     lines.append(f"  名称: {quote.get('name', 'N/A')}")
     lines.append(f"  连板数: {target_board_num}板")
     lines.append(f"  封板状态: {target_seal_status}")
-    lines.append(f"  封单/流通盘比: {target_seal_strength:.2f}%")
+    if target_first_limit_time:
+        lines.append(
+            f"  首封时间: {target_first_limit_time}"
+            f"{_source_suffix(target_data_sources, 'first_limit_time')}"
+        )
+    lines.append(
+        f"  封单/流通盘比: {target_seal_strength:.2f}%"
+        f"{_source_suffix(target_data_sources, 'seal_ratio')}"
+    )
     lines.append(f"  流通市值: {quote.get('circulation_mv', 0) / 1e8:.1f}亿" if quote.get('circulation_mv') else "  流通市值: N/A")
     if target_themes:
         lines.append(f"  所属题材: {' / '.join(target_themes[:5])}")

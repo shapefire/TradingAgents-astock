@@ -137,6 +137,13 @@ def render_sidebar() -> None:
         key="input_date",
     )
 
+    st.checkbox(
+        "短线精简模式",
+        key="short_term_mode",
+        help="仅运行 short_term / hot_money / policy / market 四位分析师，"
+        "走 ShortTermTrader，跳过 Quality Gate LLM 复审",
+    )
+
     with st.expander("⚙️ 模型配置", expanded=False):
         _render_llm_config()
 

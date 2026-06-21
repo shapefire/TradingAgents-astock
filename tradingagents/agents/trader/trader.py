@@ -12,6 +12,12 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.logic.proposal_gate import (
+    append_hard_logic_footer,
+    clamp_trader_proposal,
+    format_hard_logic_override,
+)
+from tradingagents.logic.trading_hard_logic import hard_signal_from_json
 
 
 def create_trader(llm):
@@ -21,11 +27,17 @@ def create_trader(llm):
         company_name = state["company_of_interest"]
         instrument_context = build_instrument_context(company_name)
         investment_plan = state["investment_plan"]
+        signal = hard_signal_from_json(state.get("hard_signal", ""))
+        has_short_term_context = bool(
+            state.get("short_term_report") or state.get("hard_signal_summary")
+        )
 
         # Collect A-stock specific analyst reports
         policy_report = state.get("policy_report", "")
         hot_money_report = state.get("hot_money_report", "")
         lockup_report = state.get("lockup_report", "")
+        short_term_report = state.get("short_term_report", "")
+        hard_signal_summary = state.get("hard_signal_summary", "")
 
         # Build optional A-stock context block
         astock_context_parts = []
@@ -35,6 +47,13 @@ def create_trader(llm):
             astock_context_parts.append(f"Hot Money / Capital Flow Report:\n{hot_money_report}")
         if lockup_report:
             astock_context_parts.append(f"Lockup Expiry / Insider Reduction Report:\n{lockup_report}")
+        if short_term_report:
+            astock_context_parts.append(f"Short-Term Trading Report:\n{short_term_report}")
+        if hard_signal_summary:
+            astock_context_parts.append(
+                f"Trading Hard Logic (programmatic gates — respect position_cap and can_trade):\n"
+                f"{hard_signal_summary}"
+            )
         astock_context = "\n\n".join(astock_context_parts)
 
         messages = [
@@ -57,8 +76,8 @@ def create_trader(llm):
                 "role": "user",
                 "content": (
                     f"Based on a comprehensive analysis by a team of analysts (including market, "
-                    f"sentiment, news, fundamentals, policy, capital flow, and lockup/reduction "
-                    f"specialists), here is an investment plan for {company_name}.\n\n"
+                    f"sentiment, news, fundamentals, policy, capital flow, lockup/reduction, "
+                    f"and short-term trading specialists), here is an investment plan for {company_name}.\n\n"
                     f"{instrument_context}\n\n"
                     f"Proposed Investment Plan:\n{investment_plan}\n\n"
                     + (f"Additional A-Stock Analyst Context:\n{astock_context}\n\n" if astock_context else "")
@@ -68,13 +87,31 @@ def create_trader(llm):
             },
         ]
 
-        trader_plan = invoke_structured_or_freetext(
-            structured_llm,
-            llm,
-            messages,
-            render_trader_proposal,
-            "Trader",
-        )
+        decision_obj = None
+        if structured_llm is not None:
+            try:
+                decision_obj = structured_llm.invoke(messages)
+            except Exception:
+                decision_obj = None
+
+        if decision_obj is not None:
+            proposal = decision_obj
+            adjustments: list[str] = []
+            if signal and has_short_term_context:
+                proposal, adjustments = clamp_trader_proposal(proposal, signal)
+            trader_plan = render_trader_proposal(proposal)
+            if signal and adjustments:
+                trader_plan += format_hard_logic_override(adjustments, signal)
+        else:
+            trader_plan = invoke_structured_or_freetext(
+                structured_llm,
+                llm,
+                messages,
+                render_trader_proposal,
+                "Trader",
+            )
+            if signal and has_short_term_context:
+                trader_plan = append_hard_logic_footer(trader_plan, signal)
 
         return {
             "messages": [AIMessage(content=trader_plan)],

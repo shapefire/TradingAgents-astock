@@ -34,6 +34,8 @@ Note: This is an A-share (China mainland) stock. Factor in regulatory policy imp
 - **Underweight**: Cautious view; recommend trimming exposure
 - **Sell**: Strong conviction in the bear thesis; recommend exiting or avoiding the position
 
+Also specify a **time_horizon** (e.g. '3-6 months' for medium-term views or 'T+1~3日' for short-term tactical trades).
+
 Commit to a clear stance whenever the debate's strongest arguments warrant one; reserve Hold for situations where the evidence on both sides is genuinely balanced.
 
 ---

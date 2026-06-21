@@ -59,6 +59,7 @@ from .a_stock import (
     get_first_board_screen as get_astock_first_board_screen,
     get_high_board_status as get_astock_high_board_status,
     get_leader_identification as get_astock_leader_identification,
+    get_auction_strength as get_astock_auction_strength,
 )
 
 # Configuration and routing logic
@@ -118,6 +119,7 @@ TOOLS_CATEGORIES = {
             "get_dividend_history",
             "get_daily_dragon_tiger",
             "get_northbound_stock_holdings",
+            "get_cninfo_announcements",
         ]
     },
     "short_term_data": {
@@ -128,6 +130,7 @@ TOOLS_CATEGORIES = {
             "get_first_board_screen",
             "get_high_board_status",
             "get_leader_identification",
+            "get_auction_strength",
         ]
     }
 }
@@ -254,6 +257,9 @@ VENDOR_METHODS = {
     },
     "get_leader_identification": {
         "a_stock": get_astock_leader_identification,
+    },
+    "get_auction_strength": {
+        "a_stock": get_astock_auction_strength,
     },
 }
 

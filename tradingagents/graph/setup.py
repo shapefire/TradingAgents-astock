@@ -19,12 +19,14 @@ class GraphSetup:
         deep_thinking_llm: Any,
         tool_nodes: Dict[str, ToolNode],
         conditional_logic: ConditionalLogic,
+        skip_quality_gate_llm: bool = False,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.tool_nodes = tool_nodes
         self.conditional_logic = conditional_logic
+        self.skip_quality_gate_llm = skip_quality_gate_llm
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals", "policy", "hot_money", "lockup", "short_term"]
@@ -107,13 +109,22 @@ class GraphSetup:
             tool_nodes["short_term"] = self.tool_nodes["short_term"]
 
         # Create quality gate node
-        quality_gate_node = create_quality_gate(self.quick_thinking_llm)
+        quality_gate_node = create_quality_gate(
+            self.quick_thinking_llm,
+            skip_llm_review=self.skip_quality_gate_llm,
+            active_analysts=selected_analysts,
+        )
 
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
         bear_researcher_node = create_bear_researcher(self.quick_thinking_llm)
         research_manager_node = create_research_manager(self.deep_thinking_llm)
-        trader_node = create_trader(self.quick_thinking_llm)
+        if self.conditional_logic.short_term_mode:
+            trader_node = create_short_term_trader(self.quick_thinking_llm)
+            trader_node_name = "Short Term Trader"
+        else:
+            trader_node = create_trader(self.quick_thinking_llm)
+            trader_node_name = "Trader"
 
         # Create risk analysis nodes
         aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
@@ -137,7 +148,7 @@ class GraphSetup:
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
         workflow.add_node("Research Manager", research_manager_node)
-        workflow.add_node("Trader", trader_node)
+        workflow.add_node(trader_node_name, trader_node)
         workflow.add_node("Aggressive Analyst", aggressive_analyst)
         workflow.add_node("Neutral Analyst", neutral_analyst)
         workflow.add_node("Conservative Analyst", conservative_analyst)
@@ -188,8 +199,8 @@ class GraphSetup:
                 "Research Manager": "Research Manager",
             },
         )
-        workflow.add_edge("Research Manager", "Trader")
-        workflow.add_edge("Trader", "Aggressive Analyst")
+        workflow.add_edge("Research Manager", trader_node_name)
+        workflow.add_edge(trader_node_name, "Aggressive Analyst")
         workflow.add_conditional_edges(
             "Aggressive Analyst",
             self.conditional_logic.should_continue_risk_analysis,

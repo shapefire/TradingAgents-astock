@@ -1,5 +1,8 @@
 
 
+from tradingagents.agents.utils.hard_logic_prompt import build_bear_veto_instruction
+
+
 def create_bear_researcher(llm):
     def bear_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
@@ -14,10 +17,15 @@ def create_bear_researcher(llm):
         policy_report = state.get("policy_report", "")
         hot_money_report = state.get("hot_money_report", "")
         lockup_report = state.get("lockup_report", "")
+        short_term_report = state.get("short_term_report", "")
+        hard_signal_summary = state.get("hard_signal_summary", "")
         data_quality_summary = state.get("data_quality_summary", "")
 
-        prompt = f"""You are a Bear Analyst making the case against investing in this A-share (China mainland) stock. Your goal is to present a well-reasoned argument emphasizing risks, challenges, and negative indicators unique to the Chinese market. Leverage the provided research and data to highlight potential downsides and counter bullish arguments effectively.
+        hard_signal = state.get("hard_signal", "")
+        veto_instruction = build_bear_veto_instruction(hard_signal)
 
+        prompt = f"""You are a Bear Analyst making the case against investing in this A-share (China mainland) stock. Your goal is to present a well-reasoned argument emphasizing risks, challenges, and negative indicators unique to the Chinese market. Leverage the provided research and data to highlight potential downsides and counter bullish arguments effectively.
+{veto_instruction}
 A-Share Bear Framework — prioritize these China-specific risk factors:
 - Policy Headwinds: Sudden regulatory crackdowns (e.g. industry rectification, antitrust), CSRC window guidance (窗口指导), sector-wide trading restrictions, or political risk signals
 - Lockup & Insider Selling: Upcoming lockup expiry dates with large overhang, controlling shareholders in pre-disclosure reduction windows, equity pledge liquidation risk
@@ -41,6 +49,8 @@ Company fundamentals report: {fundamentals_report}
 Policy analysis report: {policy_report}
 Hot money / capital flow report: {hot_money_report}
 Lockup expiry / insider reduction report: {lockup_report}
+Short-term trading / limit-up board report: {short_term_report}
+Trading hard logic gates (deterministic, cannot be overridden): {hard_signal_summary}
 Data quality assessment: {data_quality_summary}
 Conversation history of the debate: {history}
 Last bull argument: {current_response}

@@ -87,7 +87,26 @@ def _run(ticker: str, trade_date: str, config: dict, tracker: ProgressTracker) -
     clear_vendor_cache()
     prefetch_vendor_data(ticker, str(trade_date))
 
+    # Deterministic hard logic (same as trading_graph._run_graph).
+    hard_json = ""
+    hard_summary = ""
+    try:
+        from tradingagents.logic.trading_hard_logic import (
+            evaluate as evaluate_hard_signal,
+            hard_signal_to_json,
+            hard_signal_to_markdown,
+        )
+
+        hard = evaluate_hard_signal(ticker, str(trade_date))
+        hard_json = hard_signal_to_json(hard)
+        hard_summary = hard_signal_to_markdown(hard)
+        tracker.hard_signal_summary = hard_summary
+    except Exception:
+        pass
+
     init_state = graph.propagator.create_initial_state(ticker, trade_date)
+    init_state["hard_signal"] = hard_json
+    init_state["hard_signal_summary"] = hard_summary
     args = graph.propagator.get_graph_args(callbacks=[stats])
 
     last_chunk: dict[str, Any] = {}

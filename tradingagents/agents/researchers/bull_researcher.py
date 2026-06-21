@@ -1,5 +1,8 @@
 
 
+from tradingagents.agents.utils.hard_logic_prompt import build_bull_gate_reminder
+
+
 def create_bull_researcher(llm):
     def bull_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
@@ -14,10 +17,15 @@ def create_bull_researcher(llm):
         policy_report = state.get("policy_report", "")
         hot_money_report = state.get("hot_money_report", "")
         lockup_report = state.get("lockup_report", "")
+        short_term_report = state.get("short_term_report", "")
+        hard_signal_summary = state.get("hard_signal_summary", "")
         data_quality_summary = state.get("data_quality_summary", "")
 
-        prompt = f"""You are a Bull Analyst advocating for investing in this A-share (China mainland) stock. Your task is to build a strong, evidence-based case emphasizing growth potential, competitive advantages, and positive market indicators. Leverage the provided research and data to address concerns and counter bearish arguments effectively.
+        hard_signal = state.get("hard_signal", "")
+        gate_reminder = build_bull_gate_reminder(hard_signal)
 
+        prompt = f"""You are a Bull Analyst advocating for investing in this A-share (China mainland) stock. Your task is to build a strong, evidence-based case emphasizing growth potential, competitive advantages, and positive market indicators. Leverage the provided research and data to address concerns and counter bearish arguments effectively.
+{gate_reminder}
 A-Share Bull Framework — prioritize these China-specific bullish catalysts:
 - Policy Tailwinds: Government subsidies, industry support policies (e.g. "专精特新", national strategic sectors), favorable regulatory signals from CSRC/State Council
 - Northbound Capital (北向资金): Sustained net inflow from Hong Kong Stock Connect indicates foreign institutional conviction
@@ -40,6 +48,8 @@ Company fundamentals report: {fundamentals_report}
 Policy analysis report: {policy_report}
 Hot money / capital flow report: {hot_money_report}
 Lockup expiry / insider reduction report: {lockup_report}
+Short-term trading / limit-up board report: {short_term_report}
+Trading hard logic gates (deterministic, cannot be overridden): {hard_signal_summary}
 Data quality assessment: {data_quality_summary}
 Conversation history of the debate: {history}
 Last bear argument: {current_response}

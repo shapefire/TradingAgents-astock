@@ -529,16 +529,26 @@ def get_user_selections():
     )
     output_language = ask_output_language()
 
+    # Step 3b: Short-term focused mode
+    short_term_mode = ask_short_term_focus_mode()
+
     # Step 4: Select analysts
     console.print(
         create_question_box(
             "Step 4: Analysts Team", "Select your LLM analyst agents for the analysis"
         )
     )
-    selected_analysts = select_analysts()
-    console.print(
-        f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
-    )
+    if short_term_mode:
+        subset = DEFAULT_CONFIG.get("short_term_analyst_subset", [])
+        console.print(
+            f"[green]短线精简模式：使用分析师子集[/green] {', '.join(subset)}"
+        )
+        selected_analysts = []
+    else:
+        selected_analysts = select_analysts()
+        console.print(
+            f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
+        )
 
     # Step 5: Research depth
     console.print(
@@ -609,6 +619,7 @@ def get_user_selections():
         "openai_reasoning_effort": reasoning_effort,
         "anthropic_effort": anthropic_effort,
         "output_language": output_language,
+        "short_term_mode": short_term_mode,
     }
 
 
@@ -959,13 +970,21 @@ def run_analysis(checkpoint: bool = False):
     config["anthropic_effort"] = selections.get("anthropic_effort")
     config["output_language"] = selections.get("output_language", "English")
     config["checkpoint_enabled"] = checkpoint
+    config["short_term_mode"] = bool(selections.get("short_term_mode", False))
+    config["short_term_analyst_subset"] = DEFAULT_CONFIG.get("short_term_analyst_subset", [])
+    config["short_term_skip_quality_gate_llm"] = DEFAULT_CONFIG.get(
+        "short_term_skip_quality_gate_llm", True,
+    )
 
     # Create stats callback handler for tracking LLM/tool calls
     stats_handler = StatsCallbackHandler()
 
     # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
-    selected_set = {analyst.value for analyst in selections["analysts"]}
-    selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
+    if config["short_term_mode"]:
+        selected_analyst_keys = list(config["short_term_analyst_subset"])
+    else:
+        selected_set = {analyst.value for analyst in selections["analysts"]}
+        selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
 
     # Initialize the graph with callbacks bound to LLMs
     graph = TradingAgentsGraph(

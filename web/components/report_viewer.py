@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -21,6 +22,76 @@ def _signal_style(signal: str) -> tuple[str, str]:
     if "SELL" in s:
         return "#ef4444", "卖出"
     return "#fbbf24", "持有"
+
+
+def _parse_hard_signal(json_str: str) -> dict[str, Any]:
+    if not json_str:
+        return {}
+    try:
+        data = json.loads(json_str)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _render_hard_signal_section(final_state: dict[str, Any]) -> None:
+    """Render programmatic trading gates (collapsible)."""
+    summary = final_state.get("hard_signal_summary", "")
+    json_str = final_state.get("hard_signal", "")
+    if not summary and not json_str:
+        return
+
+    data = _parse_hard_signal(str(json_str))
+    can_trade = data.get("can_trade")
+    action = data.get("action", "—")
+    position_cap = data.get("position_cap")
+    emotion_phase = data.get("emotion_phase", "—")
+    role = data.get("role", "—")
+
+    if can_trade is True:
+        badge_color, badge_text = "#22c55e", "✅ 可交易"
+    elif can_trade is False:
+        badge_color, badge_text = "#ef4444", "❌ 不可交易"
+    else:
+        badge_color, badge_text = "#888", "—"
+
+    cap_text = f"{position_cap:.0%}" if isinstance(position_cap, (int, float)) else "—"
+
+    st.markdown(
+        f"""
+        <div style="
+            background: #12121f;
+            border: 1px solid #333;
+            border-radius: 12px;
+            padding: 1rem 1.25rem;
+            margin: 0.5rem 0 1rem;
+        ">
+            <div style="display:flex; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+                <span style="font-size:1rem; font-weight:700; color:#f5f1eb;">🎯 交易硬逻辑</span>
+                <span style="
+                    background:{badge_color}22;
+                    color:{badge_color};
+                    border:1px solid {badge_color}55;
+                    border-radius:999px;
+                    padding:0.15rem 0.65rem;
+                    font-size:0.8rem;
+                    font-weight:600;
+                ">{badge_text}</span>
+                <span style="color:#888; font-size:0.85rem;">
+                    情绪 {emotion_phase} · 角色 {role} · 策略 {action} · 仓位上限 {cap_text}
+                </span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("🎯 交易硬逻辑详情（程序化 Gate，不可被 LLM 覆盖）", expanded=False):
+        if summary:
+            st.markdown(_strip_think(str(summary)))
+        vetoes = data.get("veto_reasons") or []
+        if vetoes:
+            st.warning("硬否决：" + "、".join(str(v) for v in vetoes))
 
 
 _ANALYST_SECTIONS = [
@@ -75,6 +146,8 @@ def render_report(
     )
 
     st.caption("⚠️ 本报告由 AI 自动生成，仅供学习研究，不构成投资建议。")
+
+    _render_hard_signal_section(final_state)
 
     # Markdown export always works (no font dependency); PDF is generated
     # lazily and guarded so a PDF/font failure never crashes the results page.

@@ -18,7 +18,10 @@ def create_short_term_analyst(llm):
 
     def short_term_analyst_node(state):
         current_date = state["trade_date"]
-        instrument_context = build_instrument_context(state["company_of_interest"])
+        company = state["company_of_interest"]
+        instrument_context = build_instrument_context(company)
+        # 6-digit code for leader_identification tool (strip .SZ/.SH suffix)
+        ticker_code = company.split(".")[0] if "." in company else company
 
         tools = [
             get_stock_data,
@@ -45,7 +48,7 @@ def create_short_term_analyst(llm):
             "\n2. 调用 get_theme_heat 获取题材热度排名和趋势分析"
             "\n3. 调用 get_first_board_screen 获取首板筛选结果和二板预期评分"
             "\n4. 调用 get_high_board_status 获取高标股状态和断板风险"
-            "\n5. 调用 get_leader_identification 获取龙头识别和卡位分析"
+            f"\n5. 调用 get_leader_identification 获取龙头识别和卡位分析（目标股 {ticker_code}）"
             "\n6. 调用 get_stock_data 和 get_concept_blocks 获取个股辅助上下文"
             "\n7. 综合判断：当前市场短线环境是否适合操作、首选策略（打板/低吸/接力）、风险提示"
             "\n\n请使用以下工具："
@@ -53,7 +56,7 @@ def create_short_term_analyst(llm):
             "\n- `get_theme_heat(trade_date)`：获取题材热度排名（热度评分/趋势方向/生命周期阶段/辨识度/龙头状态）"
             "\n- `get_first_board_screen(trade_date)`：获取首板筛选+二板预期（封单质量/题材纯正度/量价配合/七因子综合评分）"
             "\n- `get_high_board_status(trade_date)`：获取高标股状态（分歧度/断板风险/累计换手/板块效应）"
-            "\n- `get_leader_identification(trade_date, theme)`：获取龙头识别+卡位分析（龙头评分/卡位检测/补涨龙/新龙头区分）"
+            f"\n- `get_leader_identification(ticker, trade_date, theme)`：获取龙头识别+卡位分析；分析目标股时 ticker={ticker_code}"
             "\n- `get_stock_data(ticker)`：获取个股 K 线数据辅助分析"
             "\n- `get_concept_blocks(ticker)`：获取个股所属概念板块"
             "\n\n撰写详细的短线博弈分析报告，给出："

@@ -6,10 +6,16 @@ from tradingagents.agents.utils.agent_states import AgentState
 class ConditionalLogic:
     """Handles conditional logic for determining graph flow."""
 
-    def __init__(self, max_debate_rounds=1, max_risk_discuss_rounds=1):
+    def __init__(
+        self,
+        max_debate_rounds=1,
+        max_risk_discuss_rounds=1,
+        short_term_mode: bool = False,
+    ):
         """Initialize with configuration parameters."""
         self.max_debate_rounds = max_debate_rounds
         self.max_risk_discuss_rounds = max_risk_discuss_rounds
+        self.short_term_mode = short_term_mode
 
     def should_continue_market(self, state: AgentState):
         """Determine if market analysis should continue."""

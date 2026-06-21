@@ -53,6 +53,16 @@ class TraderAction(str, Enum):
     SELL = "Sell"
 
 
+class ShortTermAction(str, Enum):
+    """A-share short-term tactic aligned with TradingHardLogic Gate 3 actions."""
+
+    DABAN = "打板"
+    RELAY = "接力"
+    DIP_BUY = "低吸"
+    WATCH = "观望"
+    AVOID = "回避"
+
+
 # ---------------------------------------------------------------------------
 # Research Manager
 # ---------------------------------------------------------------------------
@@ -88,17 +98,27 @@ class ResearchPlan(BaseModel):
             "including position sizing guidance consistent with the rating."
         ),
     )
+    time_horizon: Optional[str] = Field(
+        default=None,
+        description=(
+            "Recommended holding period, e.g. '3-6 months' for swing/medium term "
+            "or 'T+1~3日' for short-term tactical plans."
+        ),
+    )
 
 
 def render_research_plan(plan: ResearchPlan) -> str:
     """Render a ResearchPlan to markdown for storage and the trader's prompt context."""
-    return "\n".join([
+    parts = [
         f"**Recommendation**: {plan.recommendation.value}",
         "",
         f"**Rationale**: {plan.rationale}",
         "",
         f"**Strategic Actions**: {plan.strategic_actions}",
-    ])
+    ]
+    if plan.time_horizon:
+        parts.extend(["", f"**Time Horizon**: {plan.time_horizon}"])
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +154,10 @@ class TraderProposal(BaseModel):
     )
     position_sizing: Optional[str] = Field(
         default=None,
-        description="Optional sizing guidance, e.g. '5% of portfolio'.",
+        description=(
+            "Optional sizing guidance, e.g. '5% of portfolio'. When short-term hard logic "
+            "context is present, implied allocation must be ≤ HardSignal.position_cap."
+        ),
     )
 
 
@@ -159,6 +182,99 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
     parts.extend([
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",
+    ])
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Short-Term Trader
+# ---------------------------------------------------------------------------
+
+
+class ShortTermProposal(BaseModel):
+    """Structured short-term trade proposal produced by the Short-Term Trader.
+
+    Mirrors TradingHardLogic Gate 3 strategy labels while letting the LLM
+    specify executable entry/stop levels.  ``position`` must respect the
+    programmatic ``HardSignal.position_cap`` injected in the prompt context.
+    """
+
+    action: ShortTermAction = Field(
+        description=(
+            "Short-term tactic. Exactly one of 打板 / 接力 / 低吸 / 观望 / 回避. "
+            "Must align with HardSignal.action when can_trade=True; use 观望 or "
+            "回避 when HardSignal.can_trade=False."
+        ),
+    )
+    strategy: str = Field(
+        description=(
+            "Gate 3 strategy label, e.g. 首板打板 / 二板接力 / 高标接力 / "
+            "龙头低吸 / 空仓观望 / 硬否决. Copy or refine HardSignal.strategy."
+        ),
+    )
+    reasoning: str = Field(
+        description=(
+            "Two to four sentences anchoring the tactic in short_term_report "
+            "and hard_signal_summary. Cite emotion phase, role, and key scores."
+        ),
+    )
+    entry_price: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional limit-up queue or breakout entry price in quote currency. "
+            "Omit for 观望 / 回避."
+        ),
+    )
+    entry_condition: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional non-price entry trigger, e.g. limit-up queue or intraday pullback. "
+            "Use when price level is ambiguous."
+        ),
+    )
+    stop_loss: Optional[float] = Field(
+        default=None,
+        description=(
+            "Hard stop price. Short-term horizon mandates a stop for 打板/接力/低吸."
+        ),
+    )
+    position: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Portfolio fraction to allocate (0.0–1.0). Must be ≤ HardSignal.position_cap "
+            "from the programmatic gate output; use 0 when action is 观望 or 回避."
+        ),
+    )
+    time_horizon: str = Field(
+        default="T+1~3日",
+        description="Holding window. Short-term mode caps at T+1~3 trading days.",
+    )
+
+
+def render_short_term_proposal(proposal: ShortTermProposal) -> str:
+    """Render a ShortTermProposal to markdown for downstream agents and reports."""
+    parts = [
+        f"**Action**: {proposal.action.value}",
+        "",
+        f"**Strategy**: {proposal.strategy}",
+        "",
+        f"**Reasoning**: {proposal.reasoning}",
+    ]
+    if proposal.entry_price is not None:
+        parts.extend(["", f"**Entry Price**: {proposal.entry_price}"])
+    if proposal.entry_condition:
+        parts.extend(["", f"**Entry Condition**: {proposal.entry_condition}"])
+    if proposal.stop_loss is not None:
+        parts.extend(["", f"**Stop Loss**: {proposal.stop_loss}"])
+    parts.extend([
+        "",
+        f"**Position**: {proposal.position:.0%}",
+        "",
+        f"**Time Horizon**: {proposal.time_horizon}",
+        "",
+        f"FINAL SHORT-TERM PROPOSAL: **{proposal.action.value}**",
     ])
     return "\n".join(parts)
 

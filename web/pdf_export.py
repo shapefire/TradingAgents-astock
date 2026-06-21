@@ -344,6 +344,10 @@ def _collect_sections(final_state: dict[str, Any]) -> list[tuple[str, str]]:
     """
     sections: list[tuple[str, str]] = []
 
+    hard_summary = final_state.get("hard_signal_summary", "")
+    if hard_summary:
+        sections.append(("交易硬逻辑（程序化 Gate）", _strip_think(str(hard_summary))))
+
     for key, title in _REPORT_SECTIONS:
         content = final_state.get(key, "")
         if content:

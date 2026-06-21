@@ -1,5 +1,8 @@
 
 
+from tradingagents.agents.utils.hard_logic_prompt import build_risk_hard_signal_block
+
+
 def create_neutral_debator(llm):
     def neutral_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
@@ -16,8 +19,12 @@ def create_neutral_debator(llm):
         policy_report = state.get("policy_report", "")
         hot_money_report = state.get("hot_money_report", "")
         lockup_report = state.get("lockup_report", "")
+        short_term_report = state.get("short_term_report", "")
+        hard_signal_summary = state.get("hard_signal_summary", "")
+        hard_signal = state.get("hard_signal", "")
 
         trader_decision = state["trader_investment_plan"]
+        hard_logic_block = build_risk_hard_signal_block(hard_signal_summary, hard_signal)
 
         prompt = f"""As the Neutral Risk Analyst evaluating an A-share (China mainland) stock, your role is to provide a balanced perspective, weighing both the potential benefits and risks. Factor in A-share market structure, broader trends, and diversification strategies.
 
@@ -43,6 +50,8 @@ Company Fundamentals Report: {fundamentals_report}
 Policy Analysis Report: {policy_report}
 Hot Money / Capital Flow Report: {hot_money_report}
 Lockup Expiry / Insider Reduction Report: {lockup_report}
+Short-term trading report: {short_term_report}
+{hard_logic_block}
 Conversation history: {history} Last aggressive argument: {current_aggressive_response} Last conservative argument: {current_conservative_response}. If no responses yet, present your own argument.
 
 Advocate for a balanced, position-sized approach that captures A-share upside while respecting the market's structural constraints. Output conversationally without special formatting."""

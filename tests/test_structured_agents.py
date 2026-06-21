@@ -15,11 +15,15 @@ from tradingagents.agents.managers.research_manager import create_research_manag
 from tradingagents.agents.schemas import (
     PortfolioRating,
     ResearchPlan,
+    ShortTermAction,
+    ShortTermProposal,
     TraderAction,
     TraderProposal,
     render_research_plan,
+    render_short_term_proposal,
     render_trader_proposal,
 )
+from tradingagents.agents.trader.short_term_trader import create_short_term_trader
 from tradingagents.agents.trader.trader import create_trader
 
 
@@ -61,6 +65,51 @@ class TestRenderTraderProposal:
         assert "Stop Loss" not in md
         assert "Position Sizing" not in md
         assert "FINAL TRANSACTION PROPOSAL: **SELL**" in md
+
+
+@pytest.mark.unit
+class TestRenderShortTermProposal:
+    def test_minimal_watch(self):
+        p = ShortTermProposal(
+            action=ShortTermAction.WATCH,
+            strategy="条件不足",
+            reasoning="情绪修复初期，封单质量一般。",
+        )
+        md = render_short_term_proposal(p)
+        assert "**Action**: 观望" in md
+        assert "**Strategy**: 条件不足" in md
+        assert "**Position**: 0%" in md
+        assert "FINAL SHORT-TERM PROPOSAL: **观望**" in md
+
+    def test_daban_with_levels(self):
+        p = ShortTermProposal(
+            action=ShortTermAction.DABAN,
+            strategy="首板打板",
+            reasoning="二板预期分72，题材TOP2。",
+            entry_price=12.5,
+            stop_loss=11.8,
+            position=0.15,
+            entry_condition="涨停价排队",
+        )
+        md = render_short_term_proposal(p)
+        assert "**Action**: 打板" in md
+        assert "**Entry Price**: 12.5" in md
+        assert "**Entry Condition**: 涨停价排队" in md
+        assert "**Stop Loss**: 11.8" in md
+        assert "**Position**: 15%" in md
+        assert "**Time Horizon**: T+1~3日" in md
+        assert "FINAL SHORT-TERM PROPOSAL: **打板**" in md
+
+    def test_all_short_term_actions_render(self):
+        for action in ShortTermAction:
+            p = ShortTermProposal(
+                action=action,
+                strategy="测试",
+                reasoning="r",
+            )
+            md = render_short_term_proposal(p)
+            assert f"**Action**: {action.value}" in md
+            assert f"FINAL SHORT-TERM PROPOSAL: **{action.value}**" in md
 
 
 @pytest.mark.unit
@@ -115,6 +164,60 @@ def _structured_trader_llm(captured: dict, proposal: TraderProposal | None = Non
     llm = MagicMock()
     llm.with_structured_output.return_value = structured
     return llm
+
+
+@pytest.mark.unit
+class TestShortTermTraderAgent:
+    def test_structured_path_produces_short_term_markdown(self):
+        captured = {}
+        proposal = ShortTermProposal(
+            action=ShortTermAction.DABAN,
+            strategy="首板打板",
+            reasoning="二板预期分高，情绪修复。",
+            entry_price=10.2,
+            stop_loss=9.5,
+            position=0.15,
+        )
+        structured = MagicMock()
+        structured.invoke.side_effect = lambda prompt: (
+            captured.__setitem__("prompt", prompt) or proposal
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+        trader = create_short_term_trader(llm)
+        state = {
+            "company_of_interest": "000001",
+            "investment_plan": "**Recommendation**: Buy\n**Rationale**: ...\n**Strategic Actions**: ...",
+            "short_term_report": "情绪修复，首板候选。",
+            "hard_signal_summary": "can_trade=True, position_cap=15%",
+        }
+        result = trader(state)
+        plan = result["trader_investment_plan"]
+        assert "**Action**: 打板" in plan
+        assert "FINAL SHORT-TERM PROPOSAL: **打板**" in plan
+        assert plan in result["messages"][0].content
+
+    def test_prompt_includes_hard_signal_summary(self):
+        captured = {}
+        proposal = ShortTermProposal(
+            action=ShortTermAction.WATCH,
+            strategy="条件不足",
+            reasoning="观望。",
+        )
+        structured = MagicMock()
+        structured.invoke.side_effect = lambda prompt: (
+            captured.__setitem__("prompt", prompt) or proposal
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured
+        trader = create_short_term_trader(llm)
+        trader({
+            "company_of_interest": "000001",
+            "investment_plan": "plan",
+            "hard_signal_summary": "can_trade=False",
+        })
+        prompt = captured["prompt"]
+        assert any("can_trade=False" in m["content"] for m in prompt)
 
 
 @pytest.mark.unit

@@ -334,6 +334,21 @@ def ask_gemini_thinking_config() -> str | None:
     ).ask()
 
 
+def ask_short_term_focus_mode() -> bool:
+    """Ask whether to enable short-term focused pipeline (subset analysts + skip QG LLM)."""
+    choice = questionary.confirm(
+        "启用短线精简模式？（4 位核心分析师 + ShortTermTrader，跳过 Quality Gate LLM 复审）",
+        default=False,
+        style=questionary.Style(
+            [
+                ("answer", "fg:green"),
+                ("question", "fg:cyan"),
+            ]
+        ),
+    ).ask()
+    return bool(choice)
+
+
 def ask_output_language() -> str:
     """Ask for report output language."""
     choice = questionary.select(

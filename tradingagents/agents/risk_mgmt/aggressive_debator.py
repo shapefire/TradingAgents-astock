@@ -1,5 +1,11 @@
 
 
+from tradingagents.agents.utils.hard_logic_prompt import (
+    build_aggressive_gate_instruction,
+    build_risk_hard_signal_block,
+)
+
+
 def create_aggressive_debator(llm):
     def aggressive_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
@@ -16,11 +22,16 @@ def create_aggressive_debator(llm):
         policy_report = state.get("policy_report", "")
         hot_money_report = state.get("hot_money_report", "")
         lockup_report = state.get("lockup_report", "")
+        short_term_report = state.get("short_term_report", "")
+        hard_signal_summary = state.get("hard_signal_summary", "")
+        hard_signal = state.get("hard_signal", "")
 
         trader_decision = state["trader_investment_plan"]
+        hard_logic_block = build_risk_hard_signal_block(hard_signal_summary, hard_signal)
+        gate_instruction = build_aggressive_gate_instruction(hard_signal)
 
         prompt = f"""As the Aggressive Risk Analyst evaluating an A-share (China mainland) stock, your role is to champion high-reward opportunities and bold strategies. Focus on the potential upside, growth potential, and momentum—even when these come with elevated risk. Counter the conservative and neutral analysts with data-driven rebuttals.
-
+{gate_instruction}
 A-Share Aggressive Framework — leverage these China-specific upside arguments:
 - Limit-Up Momentum (涨停板效应): In A-shares, consecutive limit-ups create powerful momentum; T+1 actually helps by preventing same-day profit-taking, allowing multi-day runs
 - Policy-Driven Sectors: When Beijing backs a sector (e.g. AI, chips, new energy), the policy put is real — government support creates a floor that doesn't exist in Western markets
@@ -42,6 +53,8 @@ Company Fundamentals Report: {fundamentals_report}
 Policy Analysis Report: {policy_report}
 Hot Money / Capital Flow Report: {hot_money_report}
 Lockup Expiry / Insider Reduction Report: {lockup_report}
+Short-term trading report: {short_term_report}
+{hard_logic_block}
 Conversation history: {history} Last conservative argument: {current_conservative_response} Last neutral argument: {current_neutral_response}. If no responses yet, present your own argument.
 
 Engage actively, debate persuasively, and assert why aggressive positioning is optimal for this A-share opportunity. Output conversationally without special formatting."""

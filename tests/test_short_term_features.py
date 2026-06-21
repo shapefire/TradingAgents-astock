@@ -9,6 +9,11 @@ from tradingagents.dataflows.a_stock import (
     _match_limit_up_ratio,
     _limit_up_price,
     _load_ohlcv_astock,
+    _format_em_seal_time,
+    _parse_em_zt_pool_row,
+    _enrich_limitup_stock,
+    _merge_limitup_sources,
+    _get_limitup_stocks_em,
     _get_limitup_stocks,
     _get_limitdown_stocks,
     _get_stock_realtime_quote,
@@ -25,10 +30,16 @@ from tradingagents.dataflows.a_stock import (
     _calculate_board_health,
     _judge_emotion_phase,
     _calculate_emotion_metrics,
+    _get_recent_emotion_history,
+    _is_ice_point_spec_consecutive,
     get_consecutive_limit_stats,
+    _format_consecutive_limit_stats,
     # Phase 3
     _get_limitup_by_theme,
     _get_theme_history,
+    _is_trading_day,
+    _load_trading_holidays,
+    _get_limitdown_stocks_em,
     _get_theme_leader_status,
     _get_theme_active_days,
     _get_theme_phase,
@@ -38,12 +49,20 @@ from tradingagents.dataflows.a_stock import (
     get_theme_heat,
     # Phase 4
     _get_first_board_stocks,
+    _format_first_board_screen,
+    _format_high_board_status,
+    _source_suffix,
+    _merge_field_data_sources,
     _get_stock_seal_info,
     _get_historical_activity,
     _calculate_theme_purity,
     _calculate_volume_match_score,
     calculate_second_board_score,
     get_first_board_screen,
+    _match_hot_money_seat,
+    _load_known_hot_money_seats,
+    _get_lhb_seat_metrics,
+    clear_session_cache,
     # Phase 5
     _get_high_board_stocks,
     _get_high_board_detail,
@@ -246,6 +265,35 @@ class TestOhlcvCacheCoversDate:
         assert result["Date"].max().strftime("%Y-%m-%d") == "2026-06-17"
         mock_client.return_value.bars.assert_called_once()
 
+    def test_previous_day_cache_is_reused_when_covers_date(self, tmp_path):
+        import pandas as pd
+        from tradingagents.dataflows import a_stock
+
+        code = "000777"
+        cache_file = tmp_path / f"{code}-astock-daily.csv"
+        cached = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(["2026-06-15", "2026-06-16", "2026-06-17"]),
+                "Open": [1, 1, 1],
+                "High": [1, 1, 1],
+                "Low": [1, 1, 1],
+                "Close": [1, 1, 1],
+                "Volume": [1, 1, 1],
+            }
+        )
+        cached.to_csv(cache_file, index=False, encoding="utf-8")
+
+        with patch("tradingagents.dataflows.config.get_config", return_value={"data_cache_dir": str(tmp_path)}), \
+             patch.object(a_stock, "_get_mootdx_client") as mock_client, \
+             patch.object(a_stock, "datetime") as mock_dt:
+            mock_dt.now.return_value = __import__("datetime").datetime(2026, 6, 18, 10, 0, 0)
+            mock_dt.fromtimestamp = __import__("datetime").datetime.fromtimestamp
+            a_stock._ohlcv_session_cache.clear()
+            result = a_stock._load_ohlcv_astock(code, "2026-06-17")
+
+        assert len(result) == 3
+        mock_client.assert_not_called()
+
 
 class TestGetLimitupStocks:
     """P1-04: 统一涨停获取接口"""
@@ -267,6 +315,16 @@ class TestGetLimitupStocks:
         if result:
             assert "limit_type" in result[0]
 
+    def test_record_has_em_extended_fields(self):
+        """记录应包含东财扩展字段"""
+        result = _get_limitup_stocks("2026-06-17")
+        if result:
+            s = result[0]
+            assert "first_limit_time" in s
+            assert "last_limit_time" in s
+            assert "open_times" in s
+            assert "seal_amount" in s
+
     def test_empty_date(self):
         """空日期应正常处理"""
         result = _get_limitup_stocks("")
@@ -276,6 +334,113 @@ class TestGetLimitupStocks:
         """异常应被捕获返回空列表"""
         result = _get_limitup_stocks("invalid_date_format")
         assert isinstance(result, list)
+
+
+class TestEmLimitupPool:
+    """P1-01b: 东财 push2ex 涨停股池解析"""
+
+    def test_format_em_seal_time(self):
+        assert _format_em_seal_time(92500) == "09:25:00"
+        assert _format_em_seal_time(141354) == "14:13:54"
+        assert _format_em_seal_time(None) == ""
+
+    def test_parse_em_zt_pool_row(self):
+        row = {
+            "c": "600110",
+            "n": "诺德股份",
+            "lbc": 3,
+            "fbt": 92500,
+            "lbt": 92500,
+            "zbc": 0,
+            "fund": 599269259,
+            "hs": 0.93,
+            "amount": 279370304,
+            "ltsz": 29879815649.0,
+            "tshare": 29879815580.0,
+            "p": 17220,
+            "zdp": 10.03,
+            "hybk": "电池",
+            "zttj": {"days": 7, "ct": 4},
+        }
+        parsed = _parse_em_zt_pool_row(row)
+        assert parsed["code"] == "600110"
+        assert parsed["consecutive_days"] == 3
+        assert parsed["first_limit_time"] == "09:25:00"
+        assert parsed["open_times"] == 0
+        assert parsed["seal_amount"] == 599269259
+        assert parsed["limit_type"] == "一字"
+        assert parsed["price"] == 17.22
+
+    @patch("tradingagents.dataflows.a_stock._calculate_consecutive_days")
+    @patch("tradingagents.dataflows.a_stock._detect_limitup_from_kline")
+    def test_enrich_prefers_em_lbc_over_kline(self, mock_kline, mock_calc):
+        """EM 池有 lbc 时不应调用 K 线计算"""
+        mock_calc.return_value = 2
+        mock_kline.return_value = {"is_yizi": False}
+        em_pool = {
+            "000777": {
+                "consecutive_days": 3,
+                "limit_type": "换手",
+                "first_limit_time": "09:35:00",
+                "last_limit_time": "14:00:00",
+                "open_times": 1,
+                "seal_amount": 1e8,
+                "circulation_mv": 1e10,
+                "turnover_rate": 0.05,
+                "amount": 2e8,
+            }
+        }
+        stock = {"code": "000777", "name": "中核科技", "reason": "核电"}
+        result = _enrich_limitup_stock(stock, "2026-06-17", em_pool, {})
+        assert result["consecutive_days"] == 3
+        assert result["first_limit_time"] == "09:35:00"
+        assert result["open_times"] == 1
+        assert result["open_times_confirmed"] is True
+        assert result["first_limit_time_confirmed"] is True
+        mock_calc.assert_not_called()
+
+    @patch("tradingagents.dataflows.a_stock._get_em_xuangu_quotes")
+    @patch("tradingagents.dataflows.a_stock._get_limitup_stocks_ths")
+    @patch("tradingagents.dataflows.a_stock._get_limitup_stocks_em")
+    def test_merge_union_includes_ths_only_st(self, mock_em, mock_ths, mock_xuangu):
+        """合并应包含 THS 独有 ST 股"""
+        mock_em.return_value = {
+            "000777": _parse_em_zt_pool_row({
+                "c": "000777", "n": "中核科技", "lbc": 3,
+                "fbt": 93500, "lbt": 150000, "zbc": 1,
+                "fund": 1e8, "hs": 5.0, "amount": 1e8,
+                "ltsz": 1e10, "tshare": 1e10, "p": 21860, "zdp": 10.0,
+            }),
+        }
+        mock_ths.return_value = [
+            {"code": "000777", "name": "中核科技", "reason": "核电"},
+            {"code": "603922", "name": "ST金鸿", "reason": "ST概念"},
+        ]
+        mock_xuangu.return_value = {}
+        with patch("tradingagents.dataflows.a_stock._calculate_consecutive_days", return_value=3):
+            result = _merge_limitup_sources("2026-06-17")
+        codes = {s["code"] for s in result}
+        assert "000777" in codes
+        assert "603922" in codes
+        st = next(s for s in result if s["code"] == "603922")
+        assert st["reason"] == "ST概念"
+        assert st["consecutive_days"] == 3
+
+    @patch("tradingagents.dataflows.a_stock._get_em_xuangu_quotes")
+    @patch("tradingagents.dataflows.a_stock._get_limitup_stocks_ths")
+    @patch("tradingagents.dataflows.a_stock._get_limitup_stocks_em")
+    def test_merge_fallback_when_em_empty(self, mock_em, mock_ths, mock_xuangu):
+        """EM 池为空时 fallback 到 THS + K 线"""
+        mock_em.return_value = {}
+        mock_ths.return_value = [
+            {"code": "000001", "name": "平安银行", "reason": "金融"},
+        ]
+        mock_xuangu.return_value = {}
+        with patch("tradingagents.dataflows.a_stock._calculate_consecutive_days", return_value=1):
+            with patch("tradingagents.dataflows.a_stock._detect_limitup_from_kline", return_value={"is_yizi": False}):
+                result = _merge_limitup_sources("2026-01-10")
+        assert len(result) == 1
+        assert result[0]["consecutive_days"] == 1
 
 
 class TestGetLimitdownStocks:
@@ -438,6 +603,21 @@ class TestGetPreviousTradingDate:
         assert isinstance(result, str)
         assert len(result) == 10
 
+    def test_skips_holiday(self):
+        """应跳过法定节假日"""
+        # 2026-01-05 周一，前一日为 2025-12-31（跳过元旦假期+周末）
+        result = _get_previous_trading_date("2026-01-05")
+        assert result == "2025-12-31"
+
+    def test_is_trading_day_weekend(self):
+        assert _is_trading_day("2026-06-14") is False
+
+    def test_is_trading_day_holiday(self):
+        assert _is_trading_day("2026-01-01") is False
+
+    def test_is_trading_day_weekday(self):
+        assert _is_trading_day("2026-06-16") is True
+
 
 class TestGetYesterdayLimitupPerformance:
     """P2-02: 昨日涨停今日表现"""
@@ -543,6 +723,39 @@ class TestCalculateSealQuality:
         ]
         result = _calculate_seal_quality(stocks)
         assert result["effective_seal_rate"] == 100.0
+
+    def test_broken_board_seal_success_rate(self):
+        """VS-08: 接入炸板池后封板成功率 = 涨停/(涨停+炸板)"""
+        limitup = [
+            {"limit_type": "换手", "turnover_rate": 0.1},
+            {"limit_type": "一字", "turnover_rate": 0.01},
+        ]
+        broken = [{"code": "000003"}, {"code": "000004"}]
+        result = _calculate_seal_quality(limitup, broken)
+        assert result["broken_board_count"] == 2
+        assert result["broken_board_rate"] == 50.0
+        assert result["seal_success_rate"] == 50.0
+        assert result["data_sources"]["seal_success_rate"] == "[确认]"
+        assert result["data_sources"]["broken_board_rate"] == "[确认]"
+
+    def test_broken_board_empty_limitup(self):
+        """无涨停仅有炸板时封板成功率为 0"""
+        broken = [{"code": "000001"}, {"code": "000002"}, {"code": "000003"}]
+        result = _calculate_seal_quality([], broken)
+        assert result["broken_board_count"] == 3
+        assert result["seal_success_rate"] == 0.0
+        assert result["broken_board_rate"] == 100.0
+
+    def test_no_broken_pool_fallback(self):
+        """未传炸板池时封板成功率走换手板代理"""
+        stocks = [
+            {"limit_type": "换手", "turnover_rate": 0.1},
+            {"limit_type": "一字", "turnover_rate": 0.01},
+        ]
+        result = _calculate_seal_quality(stocks)
+        assert result["broken_board_count"] == 0
+        assert result["seal_success_rate"] == 50.0
+        assert result["data_sources"]["seal_success_rate"] == "[估算]"
 
 
 class TestCalculateYesterdayPerformance:
@@ -691,7 +904,10 @@ class TestJudgeEmotionPhase:
 
     def test_valid_phases(self):
         """返回值应为有效情绪周期"""
-        valid_phases = ["冰点", "冰点（已确认）", "低迷", "修复", "升温", "高潮", "退潮"]
+        valid_phases = [
+            "冰点", "冰点（已确认）", "低迷", "修复", "修复（可操作）",
+            "升温", "高潮", "高潮（减仓）", "退潮", "退潮（确认）",
+        ]
         phase = _judge_emotion_phase(
             seal_quality={"effective_seal_rate": 50},
             yesterday_performance={"avg_return": 0, "heavy_muffled_rate": 10, "muffled_rate": 15, "promotion_rates": {1: 40}},
@@ -701,12 +917,127 @@ class TestJudgeEmotionPhase:
         )
         assert phase in valid_phases
 
+    def test_retreat_confirmed(self):
+        """退潮（确认）: 前日高潮 + 今日断板 + 晋级率<30%"""
+        history = [{
+            "highest_board": 6,
+            "avg_return": 3,
+            "first_board_count": 10,
+            "heavy_muffled_rate": 5,
+            "avg_promotion_rate": 50,
+            "highest_board_dropped": False,
+        }]
+        phase = _judge_emotion_phase(
+            seal_quality={},
+            yesterday_performance={
+                "avg_return": -1, "heavy_muffled_rate": 25, "muffled_rate": 30,
+                "promotion_rates": {2: 20, 3: 15},
+            },
+            board_dist={"highest_board": 4, "distribution": {4: 1, 2: 3, 1: 8}, "total": 12},
+            market_breadth={"ad_ratio": 1.0},
+            northbound_signal={},
+            recent_emotion_history=history,
+        )
+        assert phase == "退潮（确认）"
+
+    def test_repair_actionable(self):
+        """修复（可操作）: 冰点/退潮后首板回升 + 均收益>0 + 核按钮<20%"""
+        history = [{
+            "highest_board": 2,
+            "heavy_muffled_rate": 35,
+            "first_board_count": 5,
+            "highest_board_dropped": True,
+            "avg_promotion_rate": 15,
+        }]
+        phase = _judge_emotion_phase(
+            seal_quality={},
+            yesterday_performance={
+                "avg_return": 1.5, "heavy_muffled_rate": 15, "muffled_rate": 18,
+                "promotion_rates": {1: 45, 2: 40},
+            },
+            board_dist={"highest_board": 3, "distribution": {3: 1, 2: 2, 1: 12}, "total": 15},
+            market_breadth={"ad_ratio": 1.2},
+            northbound_signal={},
+            recent_emotion_history=history,
+        )
+        assert phase == "修复（可操作）"
+
+    def test_ice_point_spec_consecutive(self):
+        """P1 冰点确认 spec: 连续2日满足三条件"""
+        history = [{
+            "highest_board": 2,
+            "total_limitup": 10,
+            "heavy_muffled_rate": 35,
+        }]
+        assert _is_ice_point_spec_consecutive(history, highest=1, total=8, heavy_muffled=32)
+
+    def test_climax_reduce_label(self):
+        """高潮（减仓）应在情绪分>70且涨停>50时标注"""
+        limitup = [
+            {"code": f"{i:06d}", "consecutive_days": 1, "limit_type": "换手", "turnover_rate": 0.08}
+            for i in range(55)
+        ]
+        limitup[0]["consecutive_days"] = 6
+        limitup[1]["consecutive_days"] = 5
+        limitup[2]["consecutive_days"] = 5
+        yesterday_perf = {
+            "avg_return": 4, "continuous_premium": 5.0, "first_board_premium": 3.0,
+            "high_open_rate": 80, "median_return": 3.5,
+            "muffled_rate": 5, "light_muffled_rate": 8, "heavy_muffled_rate": 3,
+            "promotion_rates": {1: 65, 2: 55, 3: 45, 4: 40, 5: 35},
+        }
+        market_breadth = {
+            "up_count": 3500, "down_count": 800, "flat_count": 200,
+            "ad_ratio": 4.0, "breadth_signal": "强势",
+        }
+        northbound = {"net_inflow": 50, "direction": "大幅流入", "is_confirming_strength": True, "is_confirming_weakness": False}
+
+        with patch("tradingagents.dataflows.a_stock._get_broken_board_stocks_em", return_value=[]):
+            with patch("tradingagents.dataflows.a_stock._get_recent_emotion_history", return_value=[]):
+                result = _calculate_emotion_metrics(
+                    limitup, [], yesterday_perf, market_breadth, northbound,
+                    trade_date="2026-06-16",
+                )
+        assert result["emotion_phase"] == "高潮（减仓）"
+        assert result["emotion_score"] > 70
+
+
+class TestRecentEmotionHistory:
+    """P1-B: 多日情绪历史"""
+
+    @patch("tradingagents.dataflows.a_stock._calculate_yesterday_performance")
+    @patch("tradingagents.dataflows.a_stock._get_northbound_flow_signal")
+    @patch("tradingagents.dataflows.a_stock._get_yesterday_limitup_performance")
+    @patch("tradingagents.dataflows.a_stock._get_limitup_stocks")
+    def test_returns_requested_days(
+        self, mock_limitup, mock_yesterday, mock_north, mock_calc_perf,
+    ):
+        mock_limitup.return_value = [
+            {"code": "000001", "consecutive_days": 2, "limit_type": "换手"},
+        ]
+        mock_yesterday.return_value = {"stocks": [], "total": 0}
+        mock_calc_perf.return_value = {
+            "avg_return": 1.0, "heavy_muffled_rate": 5, "muffled_rate": 10,
+            "promotion_rates": {1: 40},
+        }
+        mock_north.return_value = {"direction": "小幅流入"}
+
+        history = _get_recent_emotion_history("2026-06-18", days=3)
+        assert len(history) == 3
+        assert "highest_board" in history[0]
+        assert "first_board_count" in history[0]
+        assert mock_limitup.call_count >= 3
+
 
 class TestCalculateEmotionMetrics:
     """P2-08: 情绪指标汇总"""
 
-    def test_returns_complete_dict(self):
+    @patch("tradingagents.dataflows.a_stock._get_recent_emotion_history")
+    @patch("tradingagents.dataflows.a_stock._get_broken_board_stocks_em")
+    def test_returns_complete_dict(self, mock_broken, mock_history):
         """应返回完整的情绪指标字典"""
+        mock_broken.return_value = [{"code": "000099"}]
+        mock_history.return_value = []
         limitup = [
             {"code": "000001", "consecutive_days": 3, "limit_type": "换手", "turnover_rate": 0.08},
             {"code": "000002", "consecutive_days": 1, "limit_type": "一字", "turnover_rate": 0.01},
@@ -721,7 +1052,10 @@ class TestCalculateEmotionMetrics:
         market_breadth = {"up_count": 2000, "down_count": 1000, "flat_count": 500, "ad_ratio": 2.0, "breadth_signal": "正常"}
         northbound = {"net_inflow": 15, "direction": "小幅流入", "is_confirming_strength": True, "is_confirming_weakness": False}
 
-        result = _calculate_emotion_metrics(limitup, limitdown, yesterday_perf, market_breadth, northbound)
+        result = _calculate_emotion_metrics(
+            limitup, limitdown, yesterday_perf, market_breadth, northbound,
+            trade_date="2026-06-16",
+        )
 
         assert "highest_board" in result
         assert "board_distribution" in result
@@ -730,6 +1064,9 @@ class TestCalculateEmotionMetrics:
         assert "yizi_count" in result
         assert "huan_shou_count" in result
         assert "seal_quality" in result
+        assert result["seal_quality"]["broken_board_count"] == 1
+        assert result["seal_quality"]["data_sources"]["seal_success_rate"] == "[确认]"
+        mock_broken.assert_called_once_with("2026-06-16")
         assert "yesterday_performance" in result
         assert "board_health_score" in result
         assert "emotion_phase" in result
@@ -780,6 +1117,68 @@ class TestGetConsecutiveLimitStats:
         # 不应该抛出异常
 
 
+class TestFormatConsecutiveLimitStats:
+    """T1-04: 格式化输出含炸板率/炸板家数"""
+
+    def _sample_metrics(self) -> dict:
+        return {
+            "emotion_phase": "修复",
+            "emotion_score": 55.0,
+            "highest_board": 3,
+            "limitup_count": 40,
+            "limitdown_count": 5,
+            "yizi_count": 5,
+            "huan_shou_count": 35,
+            "board_distribution": {3: 1, 2: 2, 1: 10},
+            "board_health_score": 60.0,
+            "seal_quality": {
+                "broken_board_count": 12,
+                "broken_board_rate": 23.1,
+                "seal_success_rate": 76.9,
+                "effective_seal_rate": 87.5,
+                "seal_strength_median": 8.5,
+                "data_sources": {
+                    "broken_board_rate": "[确认]",
+                    "seal_success_rate": "[确认]",
+                },
+            },
+            "yesterday_performance": {},
+            "market_breadth": {},
+            "northbound_signal": {},
+        }
+
+    def test_includes_broken_board_in_seal_section(self):
+        """VS-08: 封板质量节应含炸板家数与炸板率"""
+        result = _format_consecutive_limit_stats(
+            self._sample_metrics(), [], "2026-06-16"
+        )
+        assert "炸板家数: 12 [确认]" in result
+        assert "炸板率: 23.1% [确认]" in result
+        assert "封板成功率: 76.9% [确认]" in result
+
+    def test_overview_includes_broken_count_when_confirmed(self):
+        """情绪总览在有炸板数据时展示炸板家数"""
+        result = _format_consecutive_limit_stats(
+            self._sample_metrics(), [], "2026-06-16"
+        )
+        assert "  炸板家数: 12" in result
+
+    def test_no_broken_fields_without_em_data(self):
+        """未接入炸板池时不展示炸板率行"""
+        metrics = self._sample_metrics()
+        metrics["seal_quality"] = {
+            "broken_board_count": 0,
+            "broken_board_rate": 0.0,
+            "seal_success_rate": 50.0,
+            "effective_seal_rate": 50.0,
+            "seal_strength_median": 0,
+            "data_sources": {"seal_success_rate": "[估算]"},
+        }
+        result = _format_consecutive_limit_stats(metrics, [], "2026-06-16")
+        assert "炸板率" not in result
+        assert "封板成功率: 50.0% [估算]" in result
+
+
 # ===========================================================================
 # Phase 3: 题材热度追踪
 # ===========================================================================
@@ -821,26 +1220,64 @@ class TestGetLimitupByTheme:
 class TestGetThemeHistory:
     """P3-02: 题材历史热度"""
 
-    def test_returns_list(self):
+    @patch("tradingagents.dataflows.a_stock._get_limitup_by_theme")
+    def test_returns_list(self, mock_theme):
         """返回应为列表"""
-        result = _get_theme_history("AI概念", days=7)
+        mock_theme.return_value = {}
+        result = _get_theme_history("AI概念", days=7, trade_date="2026-06-16")
         assert isinstance(result, list)
 
-    def test_record_fields(self):
+    @patch("tradingagents.dataflows.a_stock._get_limitup_by_theme")
+    def test_record_fields(self, mock_theme):
         """每条记录应包含 date, count, highest_board"""
-        result = _get_theme_history("AI概念", days=5)
+        mock_theme.return_value = {"AI概念": [{"board_num": 1}]}
+        result = _get_theme_history("AI概念", days=5, trade_date="2026-06-16")
         if result:
             record = result[0]
             assert "date" in record
             assert "count" in record
             assert "highest_board" in record
 
-    def test_count_is_non_negative(self):
+    @patch("tradingagents.dataflows.a_stock._get_limitup_by_theme")
+    def test_count_is_non_negative(self, mock_theme):
         """涨停数应非负"""
-        result = _get_theme_history("AI概念", days=5)
+        mock_theme.return_value = {"AI概念": [{"board_num": 2}]}
+        result = _get_theme_history("AI概念", days=5, trade_date="2026-06-16")
         for record in result:
             assert record["count"] >= 0
             assert record["highest_board"] >= 0
+
+    @patch("tradingagents.dataflows.a_stock._get_limitup_by_theme")
+    def test_anchored_to_trade_date(self, mock_theme):
+        """同一 trade_date 两次调用结果应一致"""
+        mock_theme.return_value = {
+            "AI概念": [{"code": "000001", "board_num": 2}],
+        }
+        r1 = _get_theme_history("AI概念", days=3, trade_date="2026-06-16")
+        r2 = _get_theme_history("AI概念", days=3, trade_date="2026-06-16")
+        assert r1 == r2
+        assert r1[0]["date"] == "2026-06-16"
+        assert len(r1) == 3
+
+
+class TestLimitdownHistorical:
+    @patch("tradingagents.dataflows.a_stock._em_push2ex_pool")
+    def test_limitdown_em_uses_trade_date(self, mock_pool):
+        clear_session_cache()
+        mock_pool.return_value = [
+            {"c": "000001", "n": "测试股", "zdp": -10.0},
+        ]
+        result = _get_limitdown_stocks("2026-06-10")
+        assert len(result) == 1
+        assert result[0]["code"] == "000001"
+        mock_pool.assert_called_with("getTopicDTPool", "2026-06-10", sort="fund:asc")
+
+    @patch("tradingagents.dataflows.a_stock._em_push2ex_pool")
+    def test_limitdown_empty_for_old_date_without_pool(self, mock_pool):
+        clear_session_cache()
+        mock_pool.return_value = []
+        result = _get_limitdown_stocks("2020-01-02")
+        assert result == []
 
 
 class TestGetThemeLeaderStatus:
@@ -1207,6 +1644,107 @@ class TestGetFirstBoardStocks:
         if result:
             assert "first_limit_time" in result[0]
 
+    @patch("tradingagents.dataflows.a_stock._get_limitup_stocks")
+    def test_preserves_em_first_limit_time(self, mock_limitup):
+        """东财首封时间应保留并标注 [确认]"""
+        mock_limitup.return_value = [{
+            "code": "000001",
+            "name": "测试",
+            "consecutive_days": 1,
+            "first_limit_time": "09:35:00",
+            "first_limit_time_confirmed": True,
+            "limit_type": "换手",
+        }]
+        result = _get_first_board_stocks("2026-06-16")
+        assert len(result) == 1
+        assert result[0]["first_limit_time"] == "09:35:00"
+        assert result[0]["data_sources"]["first_limit_time"] == "[确认]"
+
+
+class TestFieldDataSourceAnnotations:
+    """T1-05: 字段 [确认]/[估算] 标注"""
+
+    def test_source_suffix(self):
+        assert _source_suffix({"seal_ratio": "[确认]"}, "seal_ratio") == " [确认]"
+        assert _source_suffix({}, "seal_ratio") == ""
+
+    def test_merge_field_data_sources(self):
+        merged = _merge_field_data_sources(
+            {"seal_ratio": "[确认]"},
+            {"first_limit_time": "[估算]"},
+        )
+        assert merged == {"seal_ratio": "[确认]", "first_limit_time": "[估算]"}
+
+    def test_format_first_board_shows_source_tags(self):
+        """首板筛选输出应含置信度标注"""
+        scored = [{
+            "code": "000001",
+            "name": "测试",
+            "limit_type": "换手",
+            "first_limit_time": "09:35:00",
+            "best_theme": "AI",
+            "second_board_score": 75,
+            "volume_score": 80,
+            "seal_info": {
+                "seal_ratio": 4.5,
+                "seal_strength_score": 70,
+                "data_sources": {"seal_ratio": "[确认]"},
+            },
+            "data_sources": {
+                "seal_ratio": "[确认]",
+                "first_limit_time": "[确认]",
+            },
+        }]
+        result = _format_first_board_screen(
+            scored, "2026-06-16", 80, "修复", {"emotion_score": 55}
+        )
+        assert "封单比:4.50% [确认]" in result
+        assert "首封:09:35:00 [确认]" in result
+
+    def test_format_high_board_shows_source_tags(self):
+        """高标监控输出应含封单比/开板次数标注"""
+        reports = [{
+            "detail": {
+                "code": "000001",
+                "name": "测试",
+                "board_num": 5,
+                "seal_status": "封板",
+                "price": 10.0,
+                "change_pct": 10.0,
+                "circulation_mv": 5e9,
+                "turnover_rate": 0.08,
+                "amount": 2e8,
+                "seal_ratio": 4.5,
+                "is_yizi": False,
+                "open_count": 2,
+                "data_sources": {
+                    "seal_ratio": "[确认]",
+                    "open_count": "[确认]",
+                },
+            },
+            "divergence": {
+                "divergence_score": 20,
+                "level": "一致",
+                "can_do_high_board": True,
+            },
+            "break_risk": {
+                "risk_level": "低",
+                "risk_signals": [],
+                "consecutive_yizi_days": 0,
+                "yizi_cumulative_turnover": 0,
+            },
+            "theme_effect": {
+                "themes": ["AI"],
+                "other_stocks_in_theme": 3,
+                "is_theme_strong": True,
+            },
+        }]
+        result = _format_high_board_status(
+            reports, "2026-06-16", 5, "修复", {"emotion_score": 55}, set()
+        )
+        assert "封单/流通盘比: 4.50% [确认]" in result
+        assert "开板次数: 2次 [确认]" in result
+
 
 class TestGetStockSealInfo:
     """P4-02: 封单信息获取"""
@@ -1259,6 +1797,42 @@ class TestGetStockSealInfo:
             "amount": 1e8, "circulation_mv": 3e9,
         })
         assert 0 <= result["seal_strength_score"] <= 100
+
+    def test_em_seal_amount_confirmed_ratio(self):
+        """VS-07: 有东财 seal_amount 时用真实封单比并标注 [确认]"""
+        result = _get_stock_seal_info({
+            "turnover_rate": 0.05,
+            "limit_type": "换手",
+            "seal_amount": 225_000_000,
+            "circulation_mv": 5_000_000_000,
+            "amount": 500_000_000,
+        })
+        assert result["seal_ratio"] == 4.5
+        assert result["data_sources"]["seal_ratio"] == "[确认]"
+
+    def test_fallback_amount_estimated_ratio(self):
+        """无 seal_amount 时回退成交额/流通市值并标注 [估算]"""
+        result = _get_stock_seal_info({
+            "turnover_rate": 0.05,
+            "limit_type": "换手",
+            "seal_amount": 0,
+            "circulation_mv": 5_000_000_000,
+            "amount": 200_000_000,
+        })
+        assert result["seal_ratio"] == 4.0
+        assert result["data_sources"]["seal_ratio"] == "[估算]"
+
+    def test_em_preferred_over_amount_fallback(self):
+        """同时有 seal_amount 与 amount 时优先 EM 封单"""
+        result = _get_stock_seal_info({
+            "turnover_rate": 0.05,
+            "limit_type": "换手",
+            "seal_amount": 100_000_000,
+            "circulation_mv": 2_000_000_000,
+            "amount": 800_000_000,
+        })
+        assert result["seal_ratio"] == 5.0
+        assert result["data_sources"]["seal_ratio"] == "[确认]"
 
 
 class TestGetHistoricalActivity:
@@ -1494,6 +2068,60 @@ class TestCalculateSecondBoardScore:
         purity_diff = abs(score_high_purity - score_low_purity)
         assert seal_diff > purity_diff  # 封单权重25% > 纯正度5%
 
+    def test_hot_money_boost_adds_ten(self):
+        """知名游资买入应 +10 分"""
+        base = calculate_second_board_score(
+            seal_strength=60, volume_match=60, theme_heat=60, board_type="换手",
+        )
+        boosted = calculate_second_board_score(
+            seal_strength=60, volume_match=60, theme_heat=60, board_type="换手",
+            hot_money_boost=10,
+        )
+        assert boosted == min(100, base + 10)
+
+
+class TestHotMoneySeats:
+    def test_load_known_seats(self):
+        seats = _load_known_hot_money_seats()
+        assert len(seats) >= 5
+        assert any(s.get("name") == "炒股养家" for s in seats)
+
+    def test_match_hot_money_seat(self):
+        matched = _match_hot_money_seat("华鑫证券有限责任公司上海茅台路证券营业部")
+        assert matched == "炒股养家"
+        assert _match_hot_money_seat("某普通证券营业部") is None
+
+    @patch("tradingagents.dataflows.a_stock._eastmoney_datacenter")
+    def test_lhb_hot_money_buy_detected(self, mock_dc):
+        clear_session_cache()
+        mock_dc.side_effect = [
+            [{"TRADE_DATE": "2026-06-16"}],
+            [{
+                "OPERATEDEPT_NAME": "华鑫证券有限责任公司上海茅台路证券营业部",
+                "BUY": 50000000,
+                "OPERATEDEPT_CODE": "1",
+            }],
+            [],
+        ]
+        result = _get_lhb_seat_metrics("000001", "2026-06-16")
+        assert result["hot_money_buy"] is True
+        assert "炒股养家" in result["hot_money_seats"]
+
+    @patch("tradingagents.dataflows.a_stock._eastmoney_datacenter")
+    def test_lhb_institutional_net_sell(self, mock_dc):
+        clear_session_cache()
+        mock_dc.side_effect = [
+            [{"TRADE_DATE": "2026-06-16"}],
+            [],
+            [{
+                "OPERATEDEPT_NAME": "机构专用",
+                "SELL": 80000000,
+                "OPERATEDEPT_CODE": "0",
+            }],
+        ]
+        result = _get_lhb_seat_metrics("000002", "2026-06-16")
+        assert result["institutional_net_wan"] == -8000.0
+
 
 class TestGetFirstBoardScreen:
     """P4-07: 主接口测试"""
@@ -1567,6 +2195,52 @@ class TestGetHighBoardStocks:
             max_board = max(s.get("consecutive_days", 0) for s in result)
             for s in result:
                 assert s.get("consecutive_days", 0) == max_board
+
+
+class TestGetHighBoardDetail:
+    """P5-02: 高标股详情 — open_count 来自东财 open_times"""
+
+    _BASE_STOCK = {
+        "code": "000001",
+        "name": "测试股",
+        "consecutive_days": 5,
+        "turnover_rate": 0.16,
+        "circulation_mv": 5_000_000_000,
+        "amount": 800_000_000,
+        "seal_amount": 100_000_000,
+        "limit_type": "换手",
+        "reason": "人工智能",
+    }
+
+    @patch("tradingagents.dataflows.a_stock._detect_limitup_from_kline")
+    @patch("tradingagents.dataflows.a_stock._get_stock_realtime_quote")
+    def test_open_count_from_em_open_times(self, mock_quote, mock_kline):
+        """有 EM open_times 时直接使用并标注 [确认]"""
+        mock_quote.return_value = {"change_pct": 10.0, "price": 10.0}
+        mock_kline.return_value = {"is_yizi": False}
+        stock = {
+            **self._BASE_STOCK,
+            "open_times": 3,
+            "open_times_confirmed": True,
+        }
+        result = _get_high_board_detail(stock, "2026-06-16", {})
+        assert result["open_count"] == 3
+        assert result["data_sources"]["open_count"] == "[确认]"
+
+    @patch("tradingagents.dataflows.a_stock._detect_limitup_from_kline")
+    @patch("tradingagents.dataflows.a_stock._get_stock_realtime_quote")
+    def test_open_count_no_em_not_turnover_proxy(self, mock_quote, mock_kline):
+        """无 EM 数据时不走换手率档位估算，默认为 0"""
+        mock_quote.return_value = {"change_pct": 10.0, "price": 10.0}
+        mock_kline.return_value = {"is_yizi": False}
+        stock = {
+            **self._BASE_STOCK,
+            "open_times": 0,
+            "open_times_confirmed": False,
+        }
+        result = _get_high_board_detail(stock, "2026-06-16", {})
+        assert result["open_count"] == 0
+        assert result["data_sources"]["open_count"] == "[估算]"
 
 
 class TestCalculateDivergenceScore:
@@ -1767,6 +2441,39 @@ class TestCalculateBreakRiskLevel:
             card_position_exists=False,
         )
         assert any("市场情绪转差" in s for s in risk["risk_signals"])
+
+    def test_institutional_net_sell_medium_risk(self):
+        """机构净卖出应纳入断板风险"""
+        risk = _calculate_break_risk_level(
+            board_num=3,
+            seal_status="封板",
+            open_count=0,
+            divergence_score=10,
+            same_theme_performance=1.0,
+            market_emotion="升温",
+            consecutive_yizi_days=0,
+            yizi_cumulative_turnover=0,
+            card_position_exists=False,
+            institutional_net_wan=-800,
+        )
+        assert any("机构净卖出" in s for s in risk["risk_signals"])
+
+    def test_institutional_large_net_sell_high_risk(self):
+        """机构大幅净卖出应为高风险"""
+        risk = _calculate_break_risk_level(
+            board_num=3,
+            seal_status="封板",
+            open_count=0,
+            divergence_score=10,
+            same_theme_performance=1.0,
+            market_emotion="升温",
+            consecutive_yizi_days=0,
+            yizi_cumulative_turnover=0,
+            card_position_exists=False,
+            institutional_net_wan=-2500,
+        )
+        assert risk["risk_level"] == "高"
+        assert any("机构大幅净卖出" in s for s in risk["risk_signals"])
 
 
 class TestGetYiziCumulativeTurnover:

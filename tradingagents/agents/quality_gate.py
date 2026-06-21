@@ -1,5 +1,10 @@
 from typing import Annotated
 
+from tradingagents.agents.utils.hard_logic_prompt import (
+    check_hard_signal_report_consistency,
+    check_short_term_report_coverage,
+)
+
 REPORT_FIELDS = {
     "market": "market_report",
     "social": "sentiment_report",
@@ -8,6 +13,7 @@ REPORT_FIELDS = {
     "policy": "policy_report",
     "hot_money": "hot_money_report",
     "lockup": "lockup_report",
+    "short_term": "short_term_report",
 }
 
 ANALYST_NAMES = {
@@ -18,6 +24,7 @@ ANALYST_NAMES = {
     "policy": "政策分析师",
     "hot_money": "游资追踪师",
     "lockup": "解禁监控师",
+    "short_term": "短线博弈分析师",
 }
 
 MIN_REPORT_LENGTH = 200
@@ -65,11 +72,16 @@ def _hard_check_report(analyst_type: str, report: str) -> tuple:
 
 
 def _build_review_prompt(
-    reports: dict, trade_date: str, ticker: str
+    reports: dict,
+    trade_date: str,
+    ticker: str,
+    active_analysts: list[str] | None = None,
 ) -> str:
     """Build the LLM review prompt."""
     report_sections = []
     for analyst_type, field in REPORT_FIELDS.items():
+        if active_analysts and analyst_type not in active_analysts:
+            continue
         name = ANALYST_NAMES[analyst_type]
         content = reports.get(field, "（未运行）")
         if not content:
@@ -80,7 +92,7 @@ def _build_review_prompt(
 
     all_reports = "\n\n".join(report_sections)
 
-    return f"""你是数据质量审核员。以下是 7 位分析师对 {ticker} 在 {trade_date} 的研究报告。请逐一审核。
+    return f"""你是数据质量审核员。以下是 8 位分析师对 {ticker} 在 {trade_date} 的研究报告。请逐一审核。
 
 {all_reports}
 
@@ -101,6 +113,7 @@ def _build_review_prompt(
 | 政策分析师 | ... | ... | ... | ... |
 | 游资追踪师 | ... | ... | ... | ... |
 | 解禁监控师 | ... | ... | ... | ... |
+| 短线博弈分析师 | ... | ... | ... | ... |
 
 **整体评级**: A/B/C/D/F
 **数据可信度**: 高/中/低
@@ -115,7 +128,11 @@ def _build_review_prompt(
 """
 
 
-def create_quality_gate(llm):
+def create_quality_gate(
+    llm,
+    skip_llm_review: bool = False,
+    active_analysts: list[str] | None = None,
+):
     """Factory for the data quality gate node.
 
     Sits between the last analyst Msg Clear and Bull Researcher.
@@ -133,8 +150,29 @@ def create_quality_gate(llm):
 
         hard_results = {}
         for analyst_type, field in REPORT_FIELDS.items():
+            if active_analysts and analyst_type not in active_analysts:
+                continue
             grade, detail = _hard_check_report(analyst_type, reports[field])
             hard_results[analyst_type] = (grade, detail)
+
+        hard_signal_raw = state.get("hard_signal", "")
+        short_term_issues: list[str] = []
+        if reports.get("short_term_report"):
+            short_term_issues.extend(
+                check_short_term_report_coverage(reports["short_term_report"])
+            )
+            short_term_issues.extend(
+                check_hard_signal_report_consistency(
+                    reports["short_term_report"], hard_signal_raw,
+                )
+            )
+        if short_term_issues and "short_term" in hard_results:
+            grade, detail = hard_results["short_term"]
+            issue_text = "；".join(short_term_issues)
+            if grade in ("A", "B"):
+                hard_results["short_term"] = ("C", f"{detail}；{issue_text}")
+            else:
+                hard_results["short_term"] = (grade, f"{detail}；{issue_text}")
 
         hard_summary_lines = []
         for analyst_type, (grade, detail) in hard_results.items():
@@ -147,9 +185,16 @@ def create_quality_gate(llm):
         )
 
         llm_review = ""
-        if fail_count < 4:
+        if skip_llm_review:
+            llm_review = "（短线精简模式 — 跳过 LLM 复审）"
+        elif fail_count < 4:
             try:
-                review_prompt = _build_review_prompt(reports, trade_date, ticker)
+                review_prompt = _build_review_prompt(
+                    reports,
+                    trade_date,
+                    ticker,
+                    active_analysts=active_analysts,
+                )
                 response = llm.invoke(review_prompt)
                 llm_review = response.content
             except Exception as e:
@@ -159,6 +204,13 @@ def create_quality_gate(llm):
             f"## 数据质量门控结果\n\n"
             f"**标的**: {ticker} | **交易日**: {trade_date}\n\n"
             f"### 硬检查结果\n{hard_summary}\n\n"
+        )
+        if short_term_issues:
+            consistency_lines = "\n".join(f"- {item}" for item in short_term_issues)
+            summary += (
+                f"### 硬逻辑一致性检查\n{consistency_lines}\n\n"
+            )
+        summary += (
             f"### LLM 复审\n"
             f"{llm_review if llm_review else '（跳过 — 多数报告未通过硬检查）'}\n"
         )

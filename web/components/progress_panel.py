@@ -38,12 +38,16 @@ def render_progress(tracker: ProgressTracker) -> None:
     )
 
     completed = len(tracker.completed_stages)
-    total = len(PIPELINE_STAGES)
+    active_analyst_ids = tracker.analyst_stage_ids
+    analyst_stages = [
+        stage for stage in PIPELINE_STAGES[:8]
+        if not active_analyst_ids or stage["id"] in active_analyst_ids
+    ]
+    post_stages = PIPELINE_STAGES[8:]
+    visible_stages = analyst_stages + post_stages
+    total = len(visible_stages)
     pct = completed / total if total else 0
     st.progress(pct, text=f"{completed}/{total} 阶段完成  ·  {_format_time(tracker.elapsed)}")
-
-    analyst_stages = PIPELINE_STAGES[:7]
-    post_stages = PIPELINE_STAGES[7:]
 
     st.markdown(
         '<div style="margin:0.5rem 0 0.3rem; font-size:0.85rem; color:#888;">ANALYSTS</div>',
@@ -95,6 +99,10 @@ def render_progress(tracker: ProgressTracker) -> None:
 
     if tracker.error:
         st.error(f"错误: {tracker.error}")
+
+    if tracker.hard_signal_summary:
+        with st.expander("🎯 交易硬逻辑（已预计算）", expanded=False):
+            st.markdown(tracker.hard_signal_summary[:3000])
 
     completed_reports = [
         (stage["name"], stage["icon"], tracker.stage_reports[stage["id"]])
